@@ -10,12 +10,15 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import secrets
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from ..app.protocol import PROTOCOL_VERSION, TrialRequest, TrialStatus
@@ -82,6 +85,9 @@ class TrialRecord:
     cleanup_task: asyncio.Task[None] | None = field(default=None, repr=False)
     callback_tasks: set[asyncio.Task[Any]] = field(default_factory=set, repr=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False)
+    metadata_path: Path | None = field(default=None, repr=False)
+    terminal_at: float | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -102,10 +108,18 @@ class GatewayRegistry:
         settings: GatewaySettings,
         adapter: RunAdapter,
         clock: Any = time.monotonic,
+        terminal_metadata_dir: Path | None = None,
+        terminal_retention_s: float | None = None,
     ) -> None:
         self.settings = settings
         self._adapter = adapter
         self._clock = clock
+        self._terminal_metadata_dir = terminal_metadata_dir
+        self._terminal_retention_s = terminal_retention_s
+        if terminal_retention_s is not None and terminal_retention_s <= 0:
+            raise ValueError("terminal_retention_s must be positive")
+        if terminal_metadata_dir is not None:
+            terminal_metadata_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._fingerprint_key = secrets.token_bytes(32)
         self._records: dict[str, TrialRecord] = {}
         self._callbacks: dict[str, TrialRecord] = {}
@@ -325,12 +339,31 @@ class GatewayRegistry:
         async with record.lock:
             if record.internal_state is not InternalTrialState.ACTIVE:
                 return
+            metadata = copy.deepcopy(result.metadata)
+            if metadata and self._terminal_metadata_dir is not None:
+                destination = self._terminal_metadata_dir / (
+                    hashlib.sha256(record.request_id.encode()).hexdigest() + ".json"
+                )
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", dir=self._terminal_metadata_dir, delete=False
+                    ) as handle:
+                        temporary = Path(handle.name)
+                        json.dump(metadata, handle, allow_nan=False)
+                    os.replace(temporary, destination)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                record.metadata_path = destination
+                metadata = {}
             record.internal_state = InternalTrialState.FINALIZING
             record.public_status = result.status
             record.reward = copy.deepcopy(result.reward)
             record.metrics = copy.deepcopy(result.metrics)
             record.artifact_ref = result.artifact_ref
             record.error = copy.deepcopy(result.error)
+            record.metadata = metadata
             self._mark_terminal(record)
 
     async def _begin_cancellation(
@@ -403,6 +436,7 @@ class GatewayRegistry:
 
     def _mark_terminal(self, record: TrialRecord) -> None:
         record.internal_state = InternalTrialState.TERMINAL
+        record.terminal_at = self._clock()
         record.request = None
         record.handle = None
         self._callbacks.pop(record.rollout_id, None)
@@ -415,6 +449,16 @@ class GatewayRegistry:
             now = self._clock()
             for record in list(self._records.values()):
                 try:
+                    if (
+                        record.is_terminal
+                        and self._terminal_retention_s is not None
+                        and record.terminal_at is not None
+                        and now - record.terminal_at >= self._terminal_retention_s
+                    ):
+                        if record.metadata_path is not None:
+                            record.metadata_path.unlink(missing_ok=True)
+                        self._records.pop(record.request_id, None)
+                        continue
                     if record.internal_state is not InternalTrialState.ACTIVE:
                         continue
                     if now >= record.deadline_at:
@@ -441,6 +485,13 @@ class GatewayRegistry:
 
     @staticmethod
     def _snapshot(record: TrialRecord) -> dict[str, Any]:
+        metadata = {}
+        if record.is_terminal:
+            metadata = (
+                json.loads(record.metadata_path.read_text())
+                if record.metadata_path is not None
+                else copy.deepcopy(record.metadata)
+            )
         return {
             "protocol_version": PROTOCOL_VERSION,
             "request_id": record.request_id,
@@ -449,4 +500,5 @@ class GatewayRegistry:
             "metrics": copy.deepcopy(record.metrics),
             "artifact_ref": record.artifact_ref,
             "error": copy.deepcopy(record.error),
+            "metadata": metadata,
         }

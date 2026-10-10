@@ -1,0 +1,22 @@
+--- a/mimo_git_runtime.py
++++ b/mimo_git_runtime.py
+@@ -111,6 +111,8 @@
+         need(not packed.is_symlink() and (not packed.exists() or packed.is_file()), 'unsafe packed-refs file')
+         storage = git(cwd, 'config', '--get', 'extensions.refStorage', check=False).stdout.decode().strip()
+         need(storage in ('', 'files'), 'unsupported Git ref storage')
++        reflogs = gd / 'logs'
++        need(not reflogs.is_symlink() and (not reflogs.exists() or reflogs.is_dir()), 'unsafe Git reflogs directory')
+     base = git(cwd, 'rev-parse', '--verify', 'HEAD^{commit}').stdout.decode().strip() if git_present else None
+     tree = git(cwd, 'rev-parse', base + '^{tree}').stdout.decode().strip() if git_present else None
+     state = Path(state_path)
+@@ -180,6 +182,10 @@
+                 if path.name.endswith('.keep'):
+                     need(path.is_file() and not path.is_symlink(), 'invalid pack keep marker')
+                     path.unlink()
++        # Older Git cannot expire orphan reflogs after the refs whitelist rebuild.
++        # The source policy removes all reflog history; preserve objects for GC.
++        if (gd / 'logs').exists():
++            shutil.rmtree(gd / 'logs')
+         git(cwd, 'reflog', 'expire', '--expire=now', '--expire-unreachable=now', '--all')
+         if git(cwd, 'gc', '--prune=now', check=False).returncode:
+             git(cwd, 'repack', '-a', '-d')

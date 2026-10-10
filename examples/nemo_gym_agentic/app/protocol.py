@@ -219,6 +219,7 @@ class TrialResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     artifact_ref: str | None = None
     error: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_payload(cls, payload: Any, *, expected_request_id: str) -> "TrialResult":
@@ -248,6 +249,10 @@ class TrialResult:
             raise ProtocolValidationError("error must be null or a JSON object")
         if error is not None:
             _ensure_json_value(error, field_name="error")
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ProtocolValidationError("metadata must be a JSON object")
+        _ensure_json_value(metadata, field_name="metadata")
         return cls(
             request_id=request_id,
             status=status,
@@ -255,6 +260,7 @@ class TrialResult:
             metrics=copy.deepcopy(metrics),
             artifact_ref=artifact_ref,
             error=copy.deepcopy(error),
+            metadata=copy.deepcopy(metadata),
         )
 
     @property

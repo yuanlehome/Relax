@@ -8,6 +8,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -32,12 +33,19 @@ def create_app(
     settings: GatewaySettings,
     adapter: RunAdapter | None = None,
     callback_transport: Any = None,
+    terminal_metadata_dir: Path | None = None,
+    terminal_retention_s: float | None = None,
 ) -> FastAPI:
     run_adapter = adapter or HttpNemoGymRunAdapter(
         settings.environments.values(),
         artifact_root=settings.artifact_root,
     )
-    registry = GatewayRegistry(settings=settings, adapter=run_adapter)
+    registry = GatewayRegistry(
+        settings=settings,
+        adapter=run_adapter,
+        terminal_metadata_dir=terminal_metadata_dir,
+        terminal_retention_s=terminal_retention_s,
+    )
     callback_provider = CallbackProvider(
         registry,
         transport=callback_transport,

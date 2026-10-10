@@ -31,6 +31,7 @@ class AdapterResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     artifact_ref: str | None = None
     error: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class HttpNemoGymRunAdapter:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         artifact_root: Path | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._readiness_urls = tuple(sorted({url for spec in specs for url in spec.readiness_urls}))
         self._artifact_root = artifact_root
@@ -90,6 +92,7 @@ class HttpNemoGymRunAdapter:
             timeout=None,
             transport=transport,
             trust_env=False,
+            headers=headers,
             cookies=CookieJar(policy=_RejectAllCookiesPolicy()),
             limits=httpx.Limits(max_connections=1024, max_keepalive_connections=256),
         )
@@ -186,6 +189,7 @@ class _HttpRunHandle:
             metrics={**copy.deepcopy(result.metrics), "artifact_captured": True},
             artifact_ref=artifact_ref,
             error=copy.deepcopy(result.error),
+            metadata=copy.deepcopy(result.metadata),
         )
 
     async def abort(self) -> CleanupResult:
@@ -263,6 +267,10 @@ def _build_run_payload(request: TrialRequest, *, rollout_id: str) -> dict[str, A
 
 
 def _normalize_run_result(payload: dict[str, Any], environment: str | None = None) -> AdapterResult:
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("NeMo Gym result metadata must be a JSON object")
+    json.dumps(metadata, allow_nan=False)
     reward = payload.get("reward")
     status = TrialStatus.TRUNCATED if payload.get("truncated") else TrialStatus.COMPLETED
     metrics = payload.get("metrics", {})
@@ -317,6 +325,7 @@ def _normalize_run_result(payload: dict[str, Any], environment: str | None = Non
         reward=copy.deepcopy(reward),
         metrics=copy.deepcopy(metrics),
         artifact_ref=artifact_ref,
+        metadata=copy.deepcopy(metadata),
     )
 
 
@@ -331,6 +340,7 @@ def _with_artifact_capture_error(result: AdapterResult, error_code: str) -> Adap
         },
         artifact_ref=result.artifact_ref,
         error=copy.deepcopy(result.error),
+        metadata=copy.deepcopy(result.metadata),
     )
 
 

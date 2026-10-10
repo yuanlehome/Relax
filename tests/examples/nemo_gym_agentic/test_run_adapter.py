@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -94,6 +95,36 @@ async def test_http_adapter_normalizes_gym_result_and_checks_readiness():
         }
         run_request = next(request for request in seen if request.method == "POST")
         assert json.loads(run_request.content)["_ng_task_index"] == "capability"
+    finally:
+        await adapter.close()
+
+
+async def test_http_adapter_authenticates_run_readiness_and_cleanup_with_explicit_headers():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.headers["Authorization"] == "Bearer management-test-token"
+        assert b"management-test-token" not in request.content
+        return httpx.Response(200, json={"reward": 0, "clean": True})
+
+    spec = replace(
+        next(iter(_settings().environments.values())),
+        abort_url="http://gym.example/cleanup/{rollout_id}",
+        force_cleanup_url="http://gym.example/cleanup/{rollout_id}",
+        cleanup_probe_url="http://gym.example/cleanup/{rollout_id}",
+    )
+    adapter = HttpNemoGymRunAdapter(
+        [spec], transport=httpx.MockTransport(handler), headers={"Authorization": "Bearer management-test-token"}
+    )
+    try:
+        assert await adapter.ready()
+        handle = await adapter.start(TrialRunContext(request=_request("authenticated"), spec=spec, rollout_id="run-0"))
+        await handle.wait()
+        await handle.abort()
+        await handle.force_cleanup()
+        assert (await handle.probe_cleanup()).confirmed
+        assert len(seen) == len(spec.readiness_urls) + 4
     finally:
         await adapter.close()
 

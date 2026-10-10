@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -15,6 +16,7 @@ from relax_nemo_gym_example.app.client import (
     GatewayRequestError,
     TrialCancelled,
     build_trial_request,
+    gateway_auth_headers,
     read_session_input,
     run_trial,
 )
@@ -74,6 +76,60 @@ def py310_sleep_or_stop(monkeypatch):
             return
 
     monkeypatch.setattr(client_mod, "_sleep_or_stop", sleep_or_stop)
+
+
+def test_client_config_reads_optional_token_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("NEMO_GYM_URL", "http://gym.example")
+    monkeypatch.setenv("NEMO_GYM_TOKEN_FILE", str(tmp_path / "token"))
+    assert ClientConfig.from_env().token_file == tmp_path / "token"
+    monkeypatch.delenv("NEMO_GYM_TOKEN_FILE")
+    assert ClientConfig.from_env().token_file is None
+
+
+@pytest.mark.parametrize("content", ["", "two\ntokens", "not ascii \u2603"])
+def test_gateway_token_file_rejects_invalid_credentials(tmp_path, content):
+    path = tmp_path / "token"
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="one nonempty ASCII token"):
+        gateway_auth_headers(path)
+
+
+def test_gateway_token_file_requires_private_regular_file(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("management-test-token", encoding="utf-8")
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="private regular file"):
+        gateway_auth_headers(path)
+    path.chmod(0o600)
+    link = tmp_path / "token-link"
+    link.symlink_to(path)
+    with pytest.raises(ValueError, match="private regular file"):
+        gateway_auth_headers(link)
+    assert gateway_auth_headers(None) == {}
+
+
+async def test_gateway_client_authenticates_management_requests_without_changing_task(tmp_path: Path):
+    token_file = tmp_path / "token"
+    token_file.write_text("management-test-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    request = build_trial_request({"messages": [], "metadata": {}}, _environ())
+    seen = []
+
+    def handler(http_request):
+        seen.append(http_request)
+        assert http_request.headers["Authorization"] == "Bearer management-test-token"
+        assert b"management-test-token" not in http_request.content
+        if http_request.url.path.endswith(("/renew", "/abort")):
+            return httpx.Response(204)
+        return httpx.Response(200, json=_result_payload(request.request_id, "completed", reward=1))
+
+    async with GatewayClient(_config(token_file=token_file), transport=httpx.MockTransport(handler)) as client:
+        await client.create(request)
+        await client.get(request.request_id)
+        await client.renew(request.request_id)
+        await client.abort(request.request_id)
+    assert len(seen) == 4
 
 
 def test_build_request_preserves_session_input_and_uses_request_scoped_callback():
@@ -155,6 +211,7 @@ async def test_completed_create_uses_single_versioned_endpoint():
     assert len(seen) == 1
     assert seen[0].method == "POST"
     assert seen[0].url.path == "/v1/trials"
+    assert "Authorization" not in seen[0].headers
     assert json.loads(seen[0].content)["protocol_version"] == PROTOCOL_VERSION
 
 

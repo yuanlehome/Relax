@@ -1,0 +1,8 @@
+{
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000"
+  },
+  "permissions": {
+    "deny": ["WebSearch", "WebFetch", "AskUserQuestion", "ScheduleWakeup"]
+  }
+}

@@ -48,10 +48,12 @@ class ClientConfig:
     abort_timeout_s: float = 2.0
     retry_backoff_s: float = 0.25
     max_retries: int = 2
+    token_file: Path | None = None
 
     @classmethod
     def from_env(cls) -> "ClientConfig":
         gateway_url = _required_env("NEMO_GYM_URL").rstrip("/")
+        token_file = os.environ.get("NEMO_GYM_TOKEN_FILE", "").strip()
         if not gateway_url.startswith(("http://", "https://")):
             raise ValueError("NEMO_GYM_URL must be an absolute http(s) URL")
         return cls(
@@ -62,7 +64,22 @@ class ClientConfig:
             abort_timeout_s=_positive_float_env("NEMO_GYM_ABORT_TIMEOUT_S", 2.0),
             retry_backoff_s=_non_negative_float_env("NEMO_GYM_RETRY_BACKOFF_S", 0.25),
             max_retries=_non_negative_int_env("NEMO_GYM_MAX_RETRIES", 2),
+            token_file=Path(token_file) if token_file else None,
         )
+
+
+def gateway_auth_headers(token_file: str | Path | None) -> dict[str, str]:
+    """Load an optional private management credential without putting it in
+    task data."""
+    if token_file is None:
+        return {}
+    path = Path(token_file)
+    if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o077:
+        raise ValueError("Gateway token file must be a private regular file")
+    token = path.read_text(encoding="utf-8").strip()
+    if not token or not token.isascii() or any(character.isspace() for character in token):
+        raise ValueError("Gateway token file must contain one nonempty ASCII token")
+    return {"Authorization": "Bearer " + token}
 
 
 class GatewayClient:
@@ -73,6 +90,7 @@ class GatewayClient:
             timeout=httpx.Timeout(config.request_timeout_s, connect=min(10.0, config.request_timeout_s)),
             transport=transport,
             trust_env=False,
+            headers=gateway_auth_headers(config.token_file),
         )
 
     async def __aenter__(self) -> "GatewayClient":

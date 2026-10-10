@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -23,8 +24,46 @@ from relax_nemo_gym_example.service.registry import (
     CallbackUnavailable,
     GatewayRegistry,
     TrialConflict,
+    TrialNotFound,
 )
 from relax_nemo_gym_example.service.run_adapter import AdapterResult, CleanupResult
+
+
+@pytest.mark.asyncio
+async def test_terminal_contexts_spool_to_disk_and_expire(tmp_path: Path) -> None:
+    adapter = ControlledAdapter()
+    clock = [100.0]
+    registry = GatewayRegistry(
+        settings=_settings(),
+        adapter=adapter,
+        clock=lambda: clock[0],
+        terminal_metadata_dir=tmp_path / "results",
+        terminal_retention_s=60,
+    )
+    await registry.start()
+    try:
+        await registry.create(_request("spooled").to_payload())
+        await adapter.started.wait()
+        metadata = {"contexts": [{"name": "before", "messages": [{"role": "user", "content": "task"}]}]}
+        adapter.handles[0].result.set_result(AdapterResult(status=TrialStatus.COMPLETED, reward=0, metadata=metadata))
+        for _ in range(100):
+            if (await registry.get("spooled"))["status"] == "completed":
+                break
+            await asyncio.sleep(0.001)
+        assert (await registry.get("spooled"))["metadata"] == metadata
+        record = registry._records["spooled"]
+        assert record.metadata == {} and record.metadata_path.is_file()
+        assert record.metadata_path.stat().st_mode & 0o777 == 0o600
+        clock[0] += 61
+        for _ in range(100):
+            if "spooled" not in registry._records:
+                break
+            await asyncio.sleep(0.01)
+        with pytest.raises(TrialNotFound):
+            await registry.get("spooled")
+        assert not list((tmp_path / "results").iterdir())
+    finally:
+        await registry.close()
 
 
 class ControlledHandle:
