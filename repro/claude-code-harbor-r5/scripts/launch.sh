@@ -14,7 +14,8 @@ if [[ ! "${EXP_NAME}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   echo 'EXP_NAME must be a plain stable directory name' >&2; exit 2
 fi
 export RELAX="${REPO}"
-export MEGATRON="${BUNDLE_DIR}/runtime/Megatron-LM"
+export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
+test -d "${MEGATRON}/megatron" || { echo "Image Megatron checkout is missing" >&2; exit 2; }
 export MODEL_DIR
 export DATA_DIR="${DATA_ROOT}/aligned-150037-oci"
 export SAVE_DIR="${SAVE_DIR:-${BUNDLE_DIR}/checkpoints}"
@@ -27,8 +28,10 @@ export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export PYTHONPATH="${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
 unset RELAX_ENTRYPOINT_MODE
 mkdir -p "${SAVE_DIR}"
-python3 "${SCRIPT_DIR}/verify_bundle.py" --bundle "${BUNDLE_DIR}" \
-  --data-root "${DATA_ROOT}" --model-dir "${MODEL_DIR}/Qwen3.6-35B-A3B"
+# Historical archive checks remain available through verify_bundle.py. A fresh
+# source build has no archived environment/code manifest to compare against.
+python3 "${SCRIPT_DIR}/verify_inputs.py" --data-root "${DATA_ROOT}" \
+  --model-dir "${MODEL_DIR}/Qwen3.6-35B-A3B"
 test -s "${NEMO_GYM_TOKEN_FILE}"
 curl --noproxy '*' -fsS "${NEMO_GYM_URL}/readyz" >/dev/null
 cd "${RELAX}"

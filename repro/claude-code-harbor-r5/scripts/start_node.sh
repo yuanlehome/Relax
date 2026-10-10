@@ -11,8 +11,9 @@ RELAX_ROOT="${REPO:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
 GYM_PORT="${GYM_PORT:-27980}"
 OCI_ROOT="${OCI_ROOT:-/tmp/relax-harbor-r5-repro}"
 NODE_STATE="${BUNDLE_DIR}/service_state/${NODE_IP}"
-export NEMO_GYM_ROOT="${BUNDLE_DIR}/runtime/nemo-gym"
-export NEMO_GYM_PYTHON="${BUNDLE_DIR}/runtime/nemo-venv/bin/python"
+GYM_RUNTIME_DIR="${GYM_RUNTIME_DIR:-${BUNDLE_DIR}/runtime/gym}"
+export NEMO_GYM_ROOT="${GYM_RUNTIME_DIR}/nemo-gym"
+export NEMO_GYM_PYTHON="${GYM_RUNTIME_DIR}/nemo-venv/bin/python"
 export NEMO_GYM_COMMIT="a85670eb167ba9b48cc53a36a070eed815e6c40d"
 export NEMO_GYM_TOKEN_FILE="${BUNDLE_DIR}/private/gateway.token"
 export NEMO_GYM_CALLBACK_ALLOWED_HOSTS
@@ -27,7 +28,8 @@ export CLAUDE_CODE_MAX_CACHED_IMAGES=4
 export PATH="${BUNDLE_DIR}/runtime/oci-runtime/fuse/usr/bin:${BUNDLE_DIR}/runtime/oci-runtime/docker:${PATH}"
 export LD_LIBRARY_PATH="${BUNDLE_DIR}/runtime/oci-runtime/fuse/usr/lib/x86_64-linux-gnu:${BUNDLE_DIR}/runtime/oci-runtime/fuse/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 test -s "${NEMO_GYM_TOKEN_FILE}"
-test -x "${NEMO_GYM_PYTHON}"
+python3 "${RELAX_ROOT}/examples/claude_code_harbor/scripts/build_gym_environment.py" \
+  --prefix "${GYM_RUNTIME_DIR}" --repo "${RELAX_ROOT}" --check
 test -s "${CLAUDE_CODE_IMAGE_MAP}"
 unshare -Ur true || { echo 'User namespace unavailable: use the fixed forwarder commands in README.' >&2; exit 2; }
 # Refuse to take over live ports or an existing Docker root. No stop/kill actions.

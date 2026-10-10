@@ -1,0 +1,29 @@
+# Exact effective r5 overlay, installed with --no-deps in a separate venv.
+# The base-image contract is in gym-base-requirements.txt.
+PyJWT==2.15.1
+PyYAML==6.0.3
+Pygments==2.21.0
+anyio==4.15.1
+asttokens==2.4.1
+click==8.5.0
+cryptography==50.0.2
+devtools==0.12.2
+gprof2dot==2025.4.14
+httpx-sse==0.4.3
+hydra-core==1.3.7
+idna==3.20
+itsdangerous==2.2.0
+mcp==1.30.0
+pycparser==3.1
+pydantic==2.14.0
+pydantic-core==2.50.0
+pydantic-settings==2.15.0
+pydot==4.0.1
+pyparsing==3.3.3
+python-dotenv==1.2.4
+rpds-py==2026.9.1
+sse-starlette==3.5.0
+starlette==1.7.0
+typing-inspection==0.4.4
+uvicorn==0.54.0
+yappi==1.7.6
