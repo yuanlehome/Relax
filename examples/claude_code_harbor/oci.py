@@ -20,6 +20,8 @@ from uuid import uuid4
 
 from relax.utils.logging_utils import get_logger
 
+from .asset_paths import asset_path
+
 
 logger = get_logger(__name__)
 
@@ -93,7 +95,7 @@ class DockerSandbox:
         commands = ["set -euo pipefail"]
         targets: Path | None = None
         for index, upload in enumerate(metadata["sandbox_extra_params"]["nex_uploads"]):
-            source, destination = Path(upload["src"]), Path(upload["dst"])
+            source, destination = asset_path(upload["src"]), Path(upload["dst"])
             if (
                 not source.is_file()
                 or source.is_symlink()
@@ -231,7 +233,7 @@ exec "$PYGIT" /run/relax-control/worker.py
             return source.read().decode(errors="replace")
 
     async def verify(self) -> dict[str, Any]:
-        source = Path(self.metadata["harbor_tests_dir"])
+        source = asset_path(self.metadata["harbor_tests_dir"])
         for path in source.iterdir():
             if not path.is_file() or path.is_symlink():
                 raise ValueError("Harbor tests must be regular files")

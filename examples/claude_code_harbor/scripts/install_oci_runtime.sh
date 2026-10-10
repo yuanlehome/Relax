@@ -75,7 +75,8 @@ fi
 for tool in python3 dpkg-deb mktemp mv; do
     command -v "$tool" >/dev/null || { echo "Required tool missing: $tool" >&2; exit 2; }
 done
-prefix="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$prefix")"
+source "${SCRIPT_DIR}/cloud_paths.sh"
+harbor_resolve_paths prefix assets_dir cache_dir
 [ ! -e "$prefix" ] && [ ! -L "$prefix" ] || {
     echo 'Installation prefix already exists; choose a new directory.' >&2; exit 2;
 }

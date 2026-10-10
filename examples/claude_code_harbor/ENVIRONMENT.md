@@ -14,13 +14,83 @@ or `observed-python-packages.json` archive.
 | Claude Code / Node / SRT                    | Original dataset upload assets, installed by `install_task_runtime.sh` **inside each task OCI**. No host Claude Code installation.                                          |
 | Task data, verifier files, model            | User-mounted cloud inputs. Prepare data separately with `scripts/prepare_data.py`.                                                                                          |
 | Docker / fuse-overlayfs                     | `scripts/install_oci_runtime.sh` downloads pinned Docker/Ubuntu packages, checks SHA-256, and extracts into a private prefix. Offline packages are also supported.          |
-| Task images                                 | Prepared `ordinary-image-map.json` resolves source references; `oci.py` pulls images on demand.                                                                             |
+| Task images                                 | Data preparation generates `ordinary-image-map.json` from source image references; `oci.py` pulls images on demand.                                                         |
 
 The dependency files record the effective r5 Harbor runtime. This is a **Harbor
 service subset**, not a complete install of every upstream Gym recipe/CLI extra.
 In particular, upstream's full dependency metadata has a different Anthropic
 upper bound. We use a source `.pth` and explicit packages rather than resolve
 all of `nemo-gym`'s extras. Ray and Torch are inherited, never reinstalled.
+
+## Prepare mounted data with portable paths
+
+Configure the cloud mount **once**. Paths below it can be relative environment
+values. Preparation, Gym/OCI installers, reproduction helpers and launch scripts
+resolve such paths against `CLOUD_ROOT`; without it, relative CLI paths use cwd.
+Use the same configured roots on every node running the corresponding service.
+
+```bash
+export CLOUD_ROOT=/your/current/cloud/mount
+export REPO=yuzhe1/xiaoliang/Relax
+export SOURCE_ROOT=pevek01/youhj/codes/swe/data/rl_dataset/20261009-150037-mimo-v26-code-claude_code-srt-gitclean-w200k
+export DATA_ROOT=yuzhe1/xiaoliang/harbor-prepared-new
+export BUNDLE_DIR=yuzhe1/xiaoliang/harbor-runtime-new
+export MODEL_DIR=models  # Relative directory containing Qwen3.6-35B-A3B/
+export SAVE_DIR=yuzhe1/xiaoliang/harbor-checkpoints
+
+# These are the original task's two uploaded wheel files, not host dependencies.
+# Point this variable at their actual location in your mounted input assets.
+export WHEEL_ROOT=path/to/original/task/wheels
+export BBS_WHEEL_PATH="$WHEEL_ROOT/dressage_blackbox_server-1.0.0-py3-none-any.whl"
+export DRESSAGE_WHEEL_PATH="$WHEEL_ROOT/dressage-0.1.0-py3-none-any.whl"
+
+cd "$CLOUD_ROOT/$REPO"
+python3 examples/claude_code_harbor/scripts/prepare_data.py
+```
+
+The source dataset and all referenced uploaded files must exist on the mounted
+cloud, including the shared CC/Node/SRT/Python chunks outside the dataset folder.
+The script verifies the source JSONL digest, 2683 rows, 2683 verifier directories,
+2708 unique uploads, and applies the checked-in Git runtime compatibility patch.
+It creates a **new** output directory and preserves source task content and
+container paths (`dst`, `/testbed`, `/tests`, etc.).
+
+No `--image-map` is required for this dataset. Preparation generates each mapping
+using `/media/` → `/media-local/` and removing the terminal `-obd`, the rule checked
+against all 2683 r5 entries. Unknown image naming conventions fail explicitly;
+use `--image-map` or `IMAGE_MAP` for a separately verified override. The output
+map checksum is recorded. Generating references does not pull images; each task's
+OCI runtime performs that pull later.
+
+Original JSONL paths are resolved **before** filesystem access. The recorded
+`DATASET/tasks/TASK/tests` layout identifies the old dataset root. If its path
+relative to the cloud is unchanged, the old cloud prefix is inferred automatically.
+For example, `/old/mount/owner/data/tasks/TASK/tests` resolves under the new
+`CLOUD_ROOT/owner/data/tasks/TASK/tests`, and shared uploads under `/old/mount/...`
+resolve under `CLOUD_ROOT/...` as well. If you also rename/rearrange the dataset
+directory, set `ORIGINAL_CLOUD_ROOT=/old/mount`; `SOURCE_ROOT` selects its new
+location while other uploads retain their cloud-relative layout. Missing files,
+ambiguous roots and escaping paths fail instead of falling back to the old mount.
+
+The prepared `aligned-150037-oci/data.jsonl` stores **relative** upload/verifier
+paths. You may move the entire prepared directory, set `DATA_ROOT` to its new
+location, and use it without rewriting JSONL or checksums. `start_node.sh` exports
+an absolute `CLAUDE_CODE_DATA_ROOT` to the Gym service, which resolves those paths
+independently of cwd. When using `start_gym.sh` or `verify_oci.py` directly, export
+`CLAUDE_CODE_DATA_ROOT="$CLOUD_ROOT/$DATA_ROOT"` yourself. Changing only the training
+head's environment cannot relocate assets for an already running Gym service.
+
+`source/data.jsonl` and `source/manifest.json` remain byte-for-byte provenance
+copies, so they retain historical paths. They are not the training input. The
+legacy `--published-root` option is accepted but no longer affects prepared paths.
+BBS/Dressage wheels are copied as uploads; they are not installed into Relax/Gym.
+
+For two QS Pods with different mounts, `prepare_data_via_qs.py` supports the same
+source variables plus `TARGET_CLOUD_ROOT` for relative target `REPO`/`DATA_ROOT`.
+Supply `--qs-command`, `--source-pod`, `--source-container`, `--target-pod` and
+`--target-container`. The optional map override is read from the target Pod;
+otherwise the source worker generates it. This helper transfers prepared data
+and writes transfer evidence; it does not overwrite files in the code checkout.
 
 ## Build in the training image
 
@@ -43,14 +113,11 @@ export PIP_TRUSTED_HOST="$(python3 -m pip config get global.trusted-host)"
 
 Do not put credentials into scripts or Git.
 
-Set the paths for your own mount (the values below are placeholders):
+After setting the environment above:
 
 ```bash
-export REPO=/your/cloud/Relax
-export BUNDLE_DIR=/your/cloud/harbor-reproduction
-mkdir -p "$BUNDLE_DIR"
-
-cd "$REPO"
+mkdir -p "$CLOUD_ROOT/$BUNDLE_DIR"
+cd "$CLOUD_ROOT/$REPO"
 bash examples/claude_code_harbor/scripts/install_gym_runtime.sh \
   --repo "$REPO" --prefix "$BUNDLE_DIR/runtime/gym"
 ```
@@ -97,11 +164,9 @@ Build logs can include package-index diagnostics, so treat them as private.
 
 ## Connect the other prepared inputs
 
-After separately preparing data/model:
+After data preparation and mounting the model:
 
 ```bash
-export DATA_ROOT=/your/cloud/prepared-harbor-data
-export MODEL_DIR=/your/cloud/models  # Contains Qwen3.6-35B-A3B/
 bash examples/claude_code_harbor/scripts/install_oci_runtime.sh \
   --prefix "$BUNDLE_DIR/runtime/oci-runtime"
 python3 repro/claude-code-harbor-r5/scripts/create_gateway_token.py \
@@ -122,10 +187,11 @@ Standard HTTPS proxy settings are supported. For offline nodes, download on a
 connected machine, then mount/copy the verified package directory:
 
 ```bash
+export OCI_PACKAGES_DIR=yuzhe1/xiaoliang/oci-packages
 python3 examples/claude_code_harbor/scripts/fetch_oci_packages.py \
-  --assets-dir /your/cloud/oci-packages
+  --assets-dir "$OCI_PACKAGES_DIR"
 bash examples/claude_code_harbor/scripts/install_oci_runtime.sh \
-  --assets-dir /your/cloud/oci-packages --prefix "$BUNDLE_DIR/runtime/oci-runtime"
+  --assets-dir "$OCI_PACKAGES_DIR" --prefix "$BUNDLE_DIR/runtime/oci-runtime"
 ```
 
 Installation needs Linux x86_64, Python 3.12 and `dpkg-deb` from the training
@@ -139,7 +205,7 @@ On each **new, idle, OCI-capable** reproduction node, with the shared paths abov
 export NODE_IP=<this-node-ip>
 export NEMO_GYM_CALLBACK_ALLOWED_HOSTS=<new-serve-head-ip>
 export OCI_ROOT=/tmp/harbor-new-run
-bash "$REPO/repro/claude-code-harbor-r5/scripts/start_node.sh"
+bash "$CLOUD_ROOT/$REPO/repro/claude-code-harbor-r5/scripts/start_node.sh"
 ```
 
 `start_node.sh` checks the built Gym before starting its private Docker daemon
@@ -155,11 +221,11 @@ export MEGATRON=/root/Megatron-LM
 export RAY_ADDRESS=<new-ray-head-ip>:6379
 export RAY_DASHBOARD_ADDRESS=http://<new-ray-head-ip>:8265
 export EXP_NAME=harbor-new-reproduction
-bash "$REPO/repro/claude-code-harbor-r5/scripts/launch.sh"
+bash "$CLOUD_ROOT/$REPO/repro/claude-code-harbor-r5/scripts/launch.sh"
 ```
 
 The launch helper validates all 2683 task rows, prepared asset sizes and references,
-JSONL/runtime checksums, model shard presence, the private token and Gym readiness. It uses image Megatron and no longer requires the historical
+JSONL/runtime/image-map checksums, model shard presence, the private token and Gym readiness. It uses image Megatron and no longer requires the historical
 `bundle-manifest.json`. `verify_bundle.py` remains a separate audit tool for
 people who possess the original archive; it is not a fresh-build prerequisite.
 
@@ -169,5 +235,5 @@ The build check verifies package/source/service compatibility, not GPU training
 or learning quality. For the real task-container/tool/verifier/auto-compaction
 chain, run `scripts/verify_oci.py` with the built Gym Python, prepared data and an
 owned OCI runtime. This uses a stub model; GPU/optimizer validation remains a
-separate training run. Models, data and the ordinary image map remain inputs
-to their existing preparation stages; OCI tool packages can be downloaded automatically.
+separate training run. Models and original data/assets are user-mounted inputs;
+the ordinary image map is generated, and OCI tool packages download automatically.

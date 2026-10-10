@@ -10,6 +10,7 @@ import argparse
 import base64
 import gzip
 import json
+import os
 import pathlib
 import shlex
 import subprocess
@@ -26,22 +27,42 @@ for name in (
     "source-container",
     "target-pod",
     "target-container",
-    "target-repo",
-    "source-root",
-    "output-root",
-    "bbs-wheel",
-    "dressage-wheel",
-    "image-map",
 ):
     parser.add_argument("--" + name, required=True)
+for name, env in (
+    ("target-repo", "REPO"),
+    ("source-root", "SOURCE_ROOT"),
+    ("output-root", "DATA_ROOT"),
+    ("bbs-wheel", "BBS_WHEEL_PATH"),
+    ("dressage-wheel", "DRESSAGE_WHEEL_PATH"),
+    ("image-map", "IMAGE_MAP"),
+    ("cloud-root", "CLOUD_ROOT"),
+    ("original-cloud-root", "ORIGINAL_CLOUD_ROOT"),
+    ("target-cloud-root", "TARGET_CLOUD_ROOT"),
+):
+    parser.add_argument("--" + name, default=os.environ.get(env), help=f"Defaults to ${env}")
 arguments = parser.parse_args()
+for name in ("target_repo", "source_root", "output_root", "bbs_wheel", "dressage_wheel"):
+    if not getattr(arguments, name):
+        parser.error(f"Set --{name.replace('_', '-')} or its environment variable")
+
+
+def target_path(value: str) -> str:
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        if not arguments.target_cloud_root or not pathlib.Path(arguments.target_cloud_root).is_absolute():
+            parser.error("Relative target paths require an absolute TARGET_CLOUD_ROOT")
+        path = pathlib.Path(arguments.target_cloud_root) / path
+    return str(path)
+
+
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 QS = shlex.split(arguments.qs_command) + ["exec"]
 SOURCE = QS + [arguments.source_pod, "-c", arguments.source_container, "--", "python3", "-u", "-c"]
 TARGET = QS + [arguments.target_pod, "-c", arguments.target_container, "--", "python3", "-u", "-c"]
-REPO = arguments.target_repo.rstrip("/")
+REPO = target_path(arguments.target_repo).rstrip("/")
 BUNDLE = REPO + "/repro/claude-code-harbor-r5"
-DATA = arguments.output_root
+DATA = target_path(arguments.output_root)
 SOURCE_DATA = arguments.source_root
 STAGE = "/tmp/relax-original-data-" + uuid.uuid4().hex
 
@@ -72,25 +93,29 @@ def put(where: list[str], path: str, content: bytes) -> None:
 
 progress("stage_original_inputs")
 call(SOURCE, f"import pathlib,json;p=pathlib.Path({STAGE!r});p.mkdir(mode=0o700);print('VALUE:'+json.dumps(True))")
-image_map = call(
-    TARGET,
-    f"import pathlib,base64,json;p=pathlib.Path({arguments.image_map!r});print('VALUE:'+json.dumps(base64.b64encode(p.read_bytes()).decode()))",
-)
-image_bytes = base64.b64decode(image_map)
-if image_bytes.startswith(b"\x1f\x8b"):
-    image_bytes = gzip.decompress(image_bytes)
+if arguments.image_map:
+    image_map = call(
+        TARGET,
+        f"import pathlib,base64,json;p=pathlib.Path({target_path(arguments.image_map)!r});print('VALUE:'+json.dumps(base64.b64encode(p.read_bytes()).decode()))",
+    )
+    image_bytes = base64.b64decode(image_map)
+    if image_bytes.startswith(b"\x1f\x8b"):
+        image_bytes = gzip.decompress(image_bytes)
+    put(SOURCE, STAGE + "/ordinary-image-map.json", image_bytes)
 patch = (ROOT / "examples/claude_code_harbor/mimo_git_reflog.patch").read_bytes()
 code = (ROOT / "examples/claude_code_harbor/scripts/prepare_data.py").read_bytes()
-put(TARGET, REPO + "/examples/claude_code_harbor/scripts/prepare_data.py", code)
-put(TARGET, BUNDLE + "/input-config/ordinary-image-map.json", image_bytes)
-put(SOURCE, STAGE + "/ordinary-image-map.json", image_bytes)
 put(SOURCE, STAGE + "/mimo_git_reflog.patch", patch)
-worker = f"""import argparse,base64,json,pathlib,tarfile,traceback
+worker = f"""import base64,json,os,pathlib,tarfile
 stage=pathlib.Path({STAGE!r})
 try:
+ for name in ('CLOUD_ROOT','ORIGINAL_CLOUD_ROOT','SOURCE_ROOT','DATA_ROOT','BBS_WHEEL_PATH','DRESSAGE_WHEEL_PATH','IMAGE_MAP'):
+  os.environ.pop(name,None)
  scope={{'__name__':'prepare_from_original','__file__':{REPO + "/examples/claude_code_harbor/scripts/prepare_data.py"!r}}}
  exec(compile(base64.b64decode({base64.b64encode(code).decode()!r}),scope['__file__'],'exec'),scope)
- args=argparse.Namespace(source_root=pathlib.Path({SOURCE_DATA!r}),output_root=stage/'prepared',published_root=pathlib.Path({DATA!r}),bbs_wheel=pathlib.Path({arguments.bbs_wheel!r}),dressage_wheel=pathlib.Path({arguments.dressage_wheel!r}),image_map=stage/'ordinary-image-map.json',runtime_patch=stage/'mimo_git_reflog.patch',expected_rows=2683)
+ args=scope['parse_arguments'](['--source-root',{SOURCE_DATA!r},'--output-root',str(stage/'prepared'),'--bbs-wheel',{arguments.bbs_wheel!r},'--dressage-wheel',{arguments.dressage_wheel!r},'--runtime-patch',str(stage/'mimo_git_reflog.patch')]
+  + (['--cloud-root',{arguments.cloud_root!r}] if {bool(arguments.cloud_root)!r} else [])
+  + (['--original-cloud-root',{arguments.original_cloud_root!r}] if {bool(arguments.original_cloud_root)!r} else [])
+  + (['--image-map',str(stage/'ordinary-image-map.json')] if {bool(arguments.image_map)!r} else []))
  result=scope['prepare'](args)
  with tarfile.open(stage/'prepared.tar.gz','w:gz',compresslevel=1) as archive:
   for p in sorted((stage/'prepared').rglob('*')):

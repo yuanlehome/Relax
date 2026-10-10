@@ -72,10 +72,48 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def cloud_path(path: Path, cloud: Path | None) -> Path:
+    """CLI/env paths are relative to CLOUD_ROOT, or cwd when it is unset."""
+    return ((cloud / path) if cloud and not path.is_absolute() else path).absolute()
+
+
+def original_dataset_root(rows: list[dict]) -> Path:
+    """Locate the recorded dataset root without accessing the old mount."""
+    roots = set()
+    for row in rows:
+        tests = Path(row["metadata"]["harbor_tests_dir"])
+        if ".." in tests.parts or tests.name != "tests" or tests.parent.parent.name != "tasks":
+            raise ValueError("Expected original verifier layout: DATASET/tasks/TASK/tests")
+        roots.add(tests.parent.parent.parent)
+    if len(roots) != 1:
+        raise ValueError("Original verifier paths do not share one dataset root")
+    return roots.pop()
+
+
+def image_mapping(rows: list[dict], supplied: Path | None) -> dict[str, str]:
+    images = {row["metadata"]["sandbox_image"] for row in rows}
+    if supplied:
+        open_map = gzip.open if supplied.suffix == ".gz" else open
+        with open_map(supplied, "rt", encoding="utf-8") as stream:
+            mapping = json.load(stream)
+    else:
+        # The verified 150037 registry naming convention, not a general OCI rule.
+        if any(image.count("/media/") != 1 or not image.endswith("-obd") for image in images):
+            raise ValueError("Unknown source image convention; supply an explicit --image-map")
+        mapping = {
+            image: image.replace("/media/", "/media-local/", 1).removesuffix("-obd") for image in sorted(images)
+        }
+    if set(mapping) != images:
+        raise ValueError("OCI image map does not exactly cover the original task images")
+    if any(not isinstance(value, str) or not value or value.endswith("-obd") for value in mapping.values()):
+        raise ValueError("An ordinary OCI image reference is missing")
+    return mapping
+
+
 def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
-    source = arguments.source_root.resolve()
-    destination = arguments.output_root.resolve()
-    published = (arguments.published_root or destination).resolve()
+    cloud = arguments.cloud_root.resolve() if arguments.cloud_root else None
+    source = cloud_path(arguments.source_root, cloud).resolve()
+    destination = cloud_path(arguments.output_root, cloud).resolve()
     if destination.exists():
         raise FileExistsError("Output exists; choose a new output directory to preserve existing inputs")
     if destination.is_relative_to(source) or source.is_relative_to(destination):
@@ -86,18 +124,42 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
     source_digest = sha256(source_jsonl)
     if source_manifest.get("data_sha256") != source_digest or len(rows) != arguments.expected_rows:
         raise ValueError("Original dataset digest or row count differs from its manifest")
-    open_map = gzip.open if arguments.image_map.suffix == ".gz" else open
-    with open_map(arguments.image_map, "rt", encoding="utf-8") as stream:
-        image_map = json.load(stream)
-    if set(image_map) != {row["metadata"]["sandbox_image"] for row in rows}:
-        raise ValueError("OCI image map does not exactly cover the original task images")
-    if any(not isinstance(value, str) or not value or value.endswith("-obd") for value in image_map.values()):
-        raise ValueError("An ordinary OCI image reference is missing")
+    image_map = image_mapping(rows, cloud_path(arguments.image_map, cloud) if arguments.image_map else None)
+    original_source = original_dataset_root(rows)
+    original_cloud = arguments.original_cloud_root
+    if original_cloud and (not cloud or not original_cloud.is_absolute()):
+        raise ValueError("ORIGINAL_CLOUD_ROOT must be absolute and requires CLOUD_ROOT")
+    if cloud and not original_cloud and source.is_relative_to(cloud):
+        # Preserve the cloud-relative tree while changing only its mount point.
+        suffix = source.relative_to(cloud).parts
+        if suffix and original_source.parts[-len(suffix) :] == suffix:
+            original_cloud = original_source.parents[len(suffix) - 1]
+
+    def relocate(value: str) -> Path:
+        path = Path(value)
+        if ".." in path.parts:
+            raise ValueError("Original asset reference contains parent traversal")
+        if path.is_relative_to(original_source):
+            base, relative = source, path.relative_to(original_source)
+        elif not path.is_absolute():
+            base, relative = source, path
+        elif original_cloud and path.is_relative_to(original_cloud):
+            base, relative = cloud, path.relative_to(original_cloud)
+        elif cloud:
+            raise ValueError("Cannot relocate original upload; set ORIGINAL_CLOUD_ROOT for the old mount")
+        else:
+            base, relative = path.parent, Path(path.name)
+        result = base / relative
+        if not result.resolve().is_relative_to(base.resolve()):
+            raise ValueError("Original asset escapes its configured root")
+        return result
+
     env_paths = {
-        "BBS_WHEEL_PATH": arguments.bbs_wheel.resolve(),
-        "DRESSAGE_WHEEL_PATH": arguments.dressage_wheel.resolve(),
+        "BBS_WHEEL_PATH": cloud_path(arguments.bbs_wheel, cloud),
+        "DRESSAGE_WHEEL_PATH": cloud_path(arguments.dressage_wheel, cloud),
     }
     copies: dict[Path, Path] = {}
+    destinations: dict[Path, Path] = {}
     rendered = copy.deepcopy(rows)
     tests: set[Path] = set()
     uploads: set[Path] = set()
@@ -106,25 +168,28 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
     def asset(path: Path) -> Path:
         if not path.is_file() or path.is_symlink():
             raise FileNotFoundError("Original task upload or verifier file is missing or is a symlink")
-        path = path.resolve(strict=True)
         if path.is_relative_to(source / "tasks"):
             relative = Path("source/tasks") / path.relative_to(source / "tasks")
         elif path in env_paths.values():
             relative = Path("wheels") / path.name
         else:
-            relative = Path("assets") / hashlib.sha256(str(path).encode()).hexdigest()[:16] / path.name
+            identity = path.relative_to(cloud) if cloud and path.is_relative_to(cloud) else path
+            relative = Path("assets") / hashlib.sha256(str(identity).encode()).hexdigest()[:16] / path.name
+        if relative in destinations and destinations[relative] != path:
+            raise ValueError("Distinct source assets would overwrite one prepared path")
         copies[path] = relative
+        destinations[relative] = path
         return relative
 
     for row in rendered:
         metadata = row["metadata"]
-        test_dir = Path(metadata["harbor_tests_dir"]).resolve(strict=True)
+        test_dir = relocate(metadata["harbor_tests_dir"])
         if not test_dir.is_relative_to(source / "tasks"):
             raise ValueError("Verifier directory is outside the original dataset tasks")
         for name in ("test.sh", "test_patch.diff", "git_targets.json"):
             asset(test_dir / name)
         tests.add(test_dir)
-        metadata["harbor_tests_dir"] = str(published / "source/tasks" / test_dir.relative_to(source / "tasks"))
+        metadata["harbor_tests_dir"] = str(Path("source/tasks") / test_dir.relative_to(source / "tasks"))
         for upload in metadata["sandbox_extra_params"]["nex_uploads"]:
             if "src_env" in upload:
                 name = upload.pop("src_env")
@@ -132,14 +197,14 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
                     raise ValueError("Unrecognized or ambiguous upload environment reference")
                 path = env_paths[name]
             else:
-                path = Path(upload["src"]).absolute()
+                path = relocate(upload["src"])
             relative = asset(path)
             uploads.add(path)
             if upload["dst"] == "/tmp/mimo_git_runtime.py":
                 runtimes.add(path)
                 relative = Path("compat/mimo_git_runtime.py")
-            upload["src"] = str(published / relative)
-    if (len(uploads), len(tests), len(runtimes)) != (2708, arguments.expected_rows, 1):
+            upload["src"] = str(relative)
+    if (len(uploads), len(tests), len(runtimes)) != (arguments.expected_uploads, arguments.expected_rows, 1):
         raise ValueError("Original task upload, verifier or runtime counts differ from r5")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +219,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(original, target)
             return {
-                "source": str(original),
+                "source": str(original.relative_to(cloud) if cloud and original.is_relative_to(cloud) else original),
                 "path": str(relative),
                 "bytes": target.stat().st_size,
                 "sha256": sha256(target),
@@ -166,39 +231,34 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
         shutil.copy2(source / "manifest.json", staging / "source/manifest.json")
         runtime = next(iter(runtimes))
         (staging / "compat").mkdir()
-        patched = apply_exact_patch(runtime.read_text(), arguments.runtime_patch.read_text())
+        runtime_patch = cloud_path(arguments.runtime_patch, cloud)
+        patched = apply_exact_patch(runtime.read_text(), runtime_patch.read_text())
         (staging / "compat/mimo_git_runtime.py").write_text(patched)
         shutil.copymode(runtime, staging / "compat/mimo_git_runtime.py")
         aligned = staging / "aligned-150037-oci"
         aligned.mkdir()
-        shutil.copy2(arguments.runtime_patch, aligned / "mimo_git_reflog.patch")
+        shutil.copy2(runtime_patch, aligned / "mimo_git_reflog.patch")
         write_json(staging / "ordinary-image-map.json", image_map)
         for path, values in ((aligned / "data.jsonl", rendered),):
             path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in values))
-        portable = copy.deepcopy(rendered)
-        for row in portable:
-            meta = row["metadata"]
-            meta["harbor_tests_dir"] = str(Path(meta["harbor_tests_dir"]).relative_to(published))
-            for upload in meta["sandbox_extra_params"]["nex_uploads"]:
-                upload["src"] = str(Path(upload["src"]).relative_to(published))
-        (staging / "tasks.r5.relative.jsonl").write_text(
-            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in portable)
-        )
+        shutil.copy2(aligned / "data.jsonl", staging / "tasks.r5.relative.jsonl")
         write_json(
             aligned / "source_manifest.json",
             {
-                "source_dataset": str(source),
+                "source_dataset": str(source.relative_to(cloud) if cloud and source.is_relative_to(cloud) else source),
                 "source_data_sha256": source_digest,
-                "prepared_root": str(published),
+                "prepared_root": ".",
+                "path_format": "relative-v1",
                 "rows": len(rows),
                 "unique_uploads": len(uploads),
                 "test_dirs": len(tests),
                 "source_runtime_sha256": sha256(runtime),
                 "patched_runtime_sha256": sha256(staging / "compat/mimo_git_runtime.py"),
-                "runtime_patch_sha256": sha256(arguments.runtime_patch),
-                "ordinary_image_map_sha256": sha256(arguments.image_map),
+                "runtime_patch_sha256": sha256(runtime_patch),
+                "ordinary_image_map_sha256": sha256(staging / "ordinary-image-map.json"),
+                "image_map_source": "explicit" if arguments.image_map else "150037-media-local-without-obd",
                 "changes": [
-                    "host paths relocated",
+                    "host paths stored relative to CLAUDE_CODE_DATA_ROOT",
                     "two src_env wheel paths materialized",
                     "only the Git runtime upload replaced with the exact compatibility patch",
                 ],
@@ -224,16 +284,30 @@ def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
     }
 
 
-if __name__ == "__main__":
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--published-root", type=Path, help="Final cloud path when staging on a transfer host")
-    parser.add_argument("--bbs-wheel", type=Path, required=True)
-    parser.add_argument("--dressage-wheel", type=Path, required=True)
-    parser.add_argument("--image-map", type=Path, required=True, help="Verified ordinary OCI reference map")
+    for flag, env in (
+        ("cloud-root", "CLOUD_ROOT"),
+        ("original-cloud-root", "ORIGINAL_CLOUD_ROOT"),
+        ("source-root", "SOURCE_ROOT"),
+        ("output-root", "DATA_ROOT"),
+        ("bbs-wheel", "BBS_WHEEL_PATH"),
+        ("dressage-wheel", "DRESSAGE_WHEEL_PATH"),
+        ("image-map", "IMAGE_MAP"),
+    ):
+        parser.add_argument("--" + flag, type=Path, default=os.environ.get(env), help=f"Defaults to ${env}")
+    parser.add_argument("--published-root", type=Path, help="Legacy option; output paths are now relative")
     parser.add_argument(
         "--runtime-patch", type=Path, default=Path(__file__).resolve().parents[1] / "mimo_git_reflog.patch"
     )
     parser.add_argument("--expected-rows", type=int, default=2683)
-    print(json.dumps(prepare(parser.parse_args())))
+    parser.add_argument("--expected-uploads", type=int, default=2708)
+    args = parser.parse_args(argv)
+    for name in ("source_root", "output_root", "bbs_wheel", "dressage_wheel"):
+        if getattr(args, name) is None:
+            parser.error(f"Set --{name.replace('_', '-')} or its environment variable")
+    return args
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(parse_arguments())))

@@ -27,6 +27,8 @@ now=$(date "+%Y%m%d-%H%M%S")
 : "${DATA_DIR:?Set DATA_DIR to the source Harbor dataset directory containing data.jsonl}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent shared checkpoint root}"
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the existing Ray cluster GCS address}"
+source "${SCRIPT_DIR}/cloud_paths.sh"
+harbor_resolve_paths MODEL_DIR DATA_DIR SAVE_DIR NEMO_GYM_TOKEN_FILE
 # The node-local Gym service must already run the Harbor/CC OCI harness and
 # return metadata.contexts. Its environment/config names are deployment-owned.
 if [ -z "${CLAUDE_CODE_AGENT_COMMAND:-}" ]; then
@@ -38,12 +40,6 @@ if [ -z "${CLAUDE_CODE_AGENT_COMMAND:-}" ]; then
 fi
 AGENT_COMMAND='python3 -m examples.claude_code_harbor.run_agent'
 
-for directory in "${MODEL_DIR}" "${DATA_DIR}" "${SAVE_DIR}"; do
-   case "${directory}" in
-      /*) ;;
-      *) echo "ERROR: MODEL_DIR, DATA_DIR and SAVE_DIR must be absolute shared paths" >&2; exit 2 ;;
-   esac
-done
 if [ ! -s "${MODEL_DIR}/Qwen3.6-35B-A3B/config.json" ] || [ ! -s "${DATA_DIR}/data.jsonl" ]; then
    echo "ERROR: model config or Harbor data.jsonl is missing or empty" >&2
    exit 2

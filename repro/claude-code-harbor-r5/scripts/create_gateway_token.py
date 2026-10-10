@@ -11,7 +11,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
-    private = args.bundle.resolve() / "private"
+    private = (Path(os.environ.get("CLOUD_ROOT", ".")) / args.bundle).resolve() / "private"
     private.mkdir(mode=0o700, exist_ok=True)
     target = private / "gateway.token"
     if target.exists():

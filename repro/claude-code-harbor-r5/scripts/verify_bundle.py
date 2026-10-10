@@ -8,6 +8,7 @@ import copy
 import gzip
 import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -50,7 +51,7 @@ def verify(bundle: Path, root: Path, model: Path, full: bool) -> dict[str, int |
         checked = sum(pool.map(check_file, records))
     rows = [json.loads(line) for line in (root / "aligned-150037-oci/data.jsonl").open() if line.strip()]
     expected = copy.deepcopy([json.loads(line) for line in (root / "tasks.r5.relative.jsonl").open() if line.strip()])
-    for row in expected:
+    for row in [*rows, *expected]:
         meta = row["metadata"]
         meta["harbor_tests_dir"] = str((root / meta["harbor_tests_dir"]).resolve())
         for upload in meta["sandbox_extra_params"]["nex_uploads"]:
@@ -115,12 +116,13 @@ if __name__ == "__main__":
     parser.add_argument("--model-dir", type=Path, required=True, help="HF model directory, including model name")
     parser.add_argument("--full", action="store_true", help="Read all persisted files and verify SHA-256")
     arguments = parser.parse_args()
+    cloud = Path(os.environ.get("CLOUD_ROOT", "."))
     print(
         json.dumps(
             verify(
-                arguments.bundle.resolve(),
-                arguments.data_root.resolve(),
-                arguments.model_dir.resolve(),
+                (cloud / arguments.bundle).resolve(),
+                (cloud / arguments.data_root).resolve(),
+                (cloud / arguments.model_dir).resolve(),
                 arguments.full,
             )
         )

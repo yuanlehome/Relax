@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,22 @@ def inputs(tmp_path: Path) -> tuple[Path, Path]:
 def test_prepared_inputs_need_no_historical_environment_bundle(inputs: tuple[Path, Path]) -> None:
     result = checker.verify(*inputs, expected_rows=1)
     assert result["status"] == "PASS" and result["model_shards"] == 1
+
+
+def test_relative_prepared_inputs_verify_after_mount_change(inputs: tuple[Path, Path], tmp_path: Path) -> None:
+    root, model = inputs
+    path = root / "aligned-150037-oci/data.jsonl"
+    row = json.loads(path.read_text())
+    row["metadata"]["harbor_tests_dir"] = "tests"
+    row["metadata"]["sandbox_extra_params"]["nex_uploads"][0]["src"] = "compat/mimo_git_runtime.py"
+    path.write_text(json.dumps(row) + "\n")
+    manifest = json.loads((root / "file-manifest.json").read_text())
+    record = next(r for r in manifest["records"] if r["path"] == "aligned-150037-oci/data.jsonl")
+    record.update(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    (root / "file-manifest.json").write_text(json.dumps(manifest))
+    moved = tmp_path / "different-mount"
+    shutil.move(root, moved)
+    assert checker.verify(moved, model, expected_rows=1)["status"] == "PASS"
 
 
 @pytest.mark.parametrize("missing", ["tests/test.sh", "compat/mimo_git_runtime.py"])

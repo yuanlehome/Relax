@@ -10,6 +10,8 @@ REPO="${REPO:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
 : "${RAY_ADDRESS:?Set the reproduction Ray GCS address, head-IP:6379}"
 : "${RAY_DASHBOARD_ADDRESS:?Set the reproduction Ray Jobs HTTP address}"
 : "${EXP_NAME:?Set a stable NEW experiment name, or deliberately reuse it to resume}"
+source "${SCRIPT_DIR}/../../../examples/claude_code_harbor/scripts/cloud_paths.sh"
+harbor_resolve_paths REPO BUNDLE_DIR DATA_ROOT MODEL_DIR SAVE_DIR MEGATRON
 if [[ ! "${EXP_NAME}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   echo 'EXP_NAME must be a plain stable directory name' >&2; exit 2
 fi

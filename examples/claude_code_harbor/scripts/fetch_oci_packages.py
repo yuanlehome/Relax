@@ -98,7 +98,9 @@ def main() -> None:
     args = parser.parse_args()
     sources = {name: url for name, url in (("docker", args.docker_base_url), ("ubuntu", args.ubuntu_base_url)) if url}
     try:
-        count = prepare(args.assets_dir, check_only=args.check_only, sources=sources)
+        count = prepare(
+            Path(os.environ.get("CLOUD_ROOT", ".")) / args.assets_dir, check_only=args.check_only, sources=sources
+        )
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(1, f"{error}\n")
     print(json.dumps({"status": "PASS", "packages": count, "mode": "check" if args.check_only else "fetch"}))

@@ -212,7 +212,10 @@ def main() -> None:
     parser.add_argument("--source-url", default=NEMO_REPOSITORY, help="Git mirror; the required commit stays fixed")
     parser.add_argument("--check", action="store_true", help="Validate an existing build without installing packages")
     args = parser.parse_args()
-    result = prepare(args.prefix.absolute(), args.repo.resolve(), args.source_url, check=args.check)
+    cloud = Path(os.environ.get("CLOUD_ROOT", "."))
+    result = prepare(
+        (cloud / args.prefix).absolute(), (cloud / args.repo).resolve(), args.source_url, check=args.check
+    )
     sys.stdout.write(json.dumps(result) + "\n")
 
 

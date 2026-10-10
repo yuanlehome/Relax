@@ -5,6 +5,7 @@ optional."""
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,9 @@ if __name__ == "__main__":
     parser.add_argument("--repo", type=Path, required=True, help="Relax checkout used by the reproduction")
     parser.add_argument("--check", action="store_true", help="Validate an existing build without installing")
     arguments = parser.parse_args()
+    cloud = Path(os.environ.get("CLOUD_ROOT", "."))
+    arguments.repo = cloud / arguments.repo
+    arguments.bundle = cloud / arguments.bundle
     subprocess.run(
         [
             sys.executable,
