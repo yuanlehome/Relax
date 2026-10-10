@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Install the r5 OCI tools into a private directory using preserved packages.
+# Download and install the pinned r5 OCI tools into a private directory.
 set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     cat <<'EOF'
-Usage: install_oci_runtime.sh --assets-dir DIR --prefix DIR
+Usage: install_oci_runtime.sh --prefix DIR [--cache-dir DIR]
+       install_oci_runtime.sh --prefix DIR --assets-dir DIR
+
+Without --assets-dir, download pinned packages from Docker/Ubuntu official
+sources and verify SHA-256 before extraction. --cache-dir defaults to
+PREFIX.packages; verified cached files are reused. Optional mirror flags:
+  --docker-base-url URL  Static stable x86_64 directory
+  --ubuntu-base-url URL  Ubuntu archive root (containing pool/)
+With --assets-dir, verify local packages only; no network access is made.
 
 Run on Linux x86_64. The prefix must not exist. No sudo, package-manager
 installation, daemon startup, or training operation is performed.
@@ -16,9 +25,8 @@ Required files under --assets-dir:
   fuse-debs/fuse3_3.14.0-5build1_amd64.deb
   fuse-debs/libfuse3-3_3.14.0-5build1_amd64.deb
 
-These are external installation packages, not Git inputs. Use the preserved
-runtime/oci-runtime directory as --assets-dir, or obtain the same packages
-from your package mirror. The script does not copy an installed environment.
+Packages and generated runtime directories are not Git inputs. No saved r5
+installation packages or installed environment are required for online mode.
 
 Output layout:
   PREFIX/docker/    Docker, dockerd, containerd, runc
@@ -31,7 +39,9 @@ EOF
 }
 
 assets_dir=
+cache_dir=
 prefix=
+mirror_args=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --assets-dir|--prefix)
@@ -42,22 +52,40 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2
             ;;
+        --cache-dir|--docker-base-url|--ubuntu-base-url)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            if [ "$1" = --cache-dir ]; then
+                cache_dir="$2"
+            else
+                mirror_args+=("$1" "$2")
+            fi
+            shift 2
+            ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
 done
-[ -n "$assets_dir" ] && [ -n "$prefix" ] || { usage >&2; exit 2; }
+[ -n "$prefix" ] || { usage >&2; exit 2; }
+if [ -n "$assets_dir" ] && { [ -n "$cache_dir" ] || [ "${#mirror_args[@]}" -gt 0 ]; }; then
+    echo '--assets-dir is offline mode; do not combine it with download options.' >&2; exit 2
+fi
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {
     echo 'Linux x86_64 is required.' >&2; exit 2;
 }
 for tool in python3 dpkg-deb mktemp mv; do
     command -v "$tool" >/dev/null || { echo "Required tool missing: $tool" >&2; exit 2; }
 done
-assets_dir="$(cd -- "$assets_dir" && pwd)"
 prefix="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$prefix")"
 [ ! -e "$prefix" ] && [ ! -L "$prefix" ] || {
     echo 'Installation prefix already exists; choose a new directory.' >&2; exit 2;
 }
+if [ -n "$assets_dir" ]; then
+    python3 "$SCRIPT_DIR/fetch_oci_packages.py" --assets-dir "$assets_dir" --check-only
+else
+    assets_dir="${cache_dir:-${prefix}.packages}"
+    python3 "$SCRIPT_DIR/fetch_oci_packages.py" --assets-dir "$assets_dir" "${mirror_args[@]}"
+fi
+assets_dir="$(cd -- "$assets_dir" && pwd)"
 docker_archive="$assets_dir/docker-28.5.2.tgz"
 fuse_packages=(
     "$assets_dir/fuse-debs/fuse-overlayfs_1.13-1_amd64.deb"

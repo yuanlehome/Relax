@@ -13,7 +13,7 @@ or `observed-python-packages.json` archive.
 | Gym Python packages                         | New `--system-site-packages` venv. Install the 27 exact versions in `scripts/gym-requirements.txt`; validate the inherited versions in `scripts/gym-base-requirements.txt`. |
 | Claude Code / Node / SRT                    | Original dataset upload assets, installed by `install_task_runtime.sh` **inside each task OCI**. No host Claude Code installation.                                          |
 | Task data, verifier files, model            | User-mounted cloud inputs. Prepare data separately with `scripts/prepare_data.py`.                                                                                          |
-| Docker / fuse-overlayfs                     | `scripts/install_oci_runtime.sh` installs supplied distribution archives into a private prefix.                                                                             |
+| Docker / fuse-overlayfs                     | `scripts/install_oci_runtime.sh` downloads pinned Docker/Ubuntu packages, checks SHA-256, and extracts into a private prefix. Offline packages are also supported.          |
 | Task images                                 | Prepared `ordinary-image-map.json` resolves source references; `oci.py` pulls images on demand.                                                                             |
 
 The dependency files record the effective r5 Harbor runtime. This is a **Harbor
@@ -97,18 +97,41 @@ Build logs can include package-index diagnostics, so treat them as private.
 
 ## Connect the other prepared inputs
 
-After separately preparing data/model and the OCI distribution archives:
+After separately preparing data/model:
 
 ```bash
 export DATA_ROOT=/your/cloud/prepared-harbor-data
 export MODEL_DIR=/your/cloud/models  # Contains Qwen3.6-35B-A3B/
-export OCI_PACKAGES=/your/cloud/oci-installation-packages
-
 bash examples/claude_code_harbor/scripts/install_oci_runtime.sh \
-  --assets-dir "$OCI_PACKAGES" --prefix "$BUNDLE_DIR/runtime/oci-runtime"
+  --prefix "$BUNDLE_DIR/runtime/oci-runtime"
 python3 repro/claude-code-harbor-r5/scripts/create_gateway_token.py \
   --bundle "$BUNDLE_DIR"
 ```
+
+The OCI installer downloads Docker 28.5.2 from the [Docker static archive](https://download.docker.com/linux/static/stable/x86_64/),
+plus fuse-overlayfs 1.13-1 and fuse3/libfuse3-3 3.14.0-5build1 from the
+[Ubuntu archive](https://archive.ubuntu.com/ubuntu/). The checked-in
+`scripts/oci-packages.json` locks filenames, sizes and SHA-256 values to r5's
+packages. Both downloaded and offline packages must pass these checks.
+The default cache is `PREFIX.packages`; use `--cache-dir DIR` to share a cache.
+A corrupt existing cache file causes failure and is not silently replaced.
+
+For a network mirror, pass `--docker-base-url` (static stable x86_64 directory)
+and/or `--ubuntu-base-url` (Ubuntu root containing `pool/`); hashes remain fixed.
+Standard HTTPS proxy settings are supported. For offline nodes, download on a
+connected machine, then mount/copy the verified package directory:
+
+```bash
+python3 examples/claude_code_harbor/scripts/fetch_oci_packages.py \
+  --assets-dir /your/cloud/oci-packages
+bash examples/claude_code_harbor/scripts/install_oci_runtime.sh \
+  --assets-dir /your/cloud/oci-packages --prefix "$BUNDLE_DIR/runtime/oci-runtime"
+```
+
+Installation needs Linux x86_64, Python 3.12 and `dpkg-deb` from the training
+image. It does not run `apt`, modify system packages, start Docker, or grant
+host privileges. The node/Pod must separately provide accessible `/dev/fuse`
+and permitted user namespaces/mount operations for the FUSE storage driver.
 
 On each **new, idle, OCI-capable** reproduction node, with the shared paths above:
 
@@ -146,5 +169,5 @@ The build check verifies package/source/service compatibility, not GPU training
 or learning quality. For the real task-container/tool/verifier/auto-compaction
 chain, run `scripts/verify_oci.py` with the built Gym Python, prepared data and an
 owned OCI runtime. This uses a stub model; GPU/optimizer validation remains a
-separate training run. Models, data, OCI distribution archives and the ordinary
-image map remain inputs to their existing preparation stages.
+separate training run. Models, data and the ordinary image map remain inputs
+to their existing preparation stages; OCI tool packages can be downloaded automatically.

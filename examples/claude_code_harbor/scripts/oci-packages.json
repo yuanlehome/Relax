@@ -1,0 +1,36 @@
+{
+  "sources": {
+    "docker": "https://download.docker.com/linux/static/stable/x86_64",
+    "ubuntu": "https://archive.ubuntu.com/ubuntu"
+  },
+  "packages": [
+    {
+      "path": "docker-28.5.2.tgz",
+      "source": "docker",
+      "remote_path": "docker-28.5.2.tgz",
+      "bytes": 81477327,
+      "sha256": "ea90cfd12e1eeb12aa1c971741adb8bd4ed88e2a574eaac13f5029a1dbc6300d"
+    },
+    {
+      "path": "fuse-debs/fuse-overlayfs_1.13-1_amd64.deb",
+      "source": "ubuntu",
+      "remote_path": "pool/universe/f/fuse-overlayfs/fuse-overlayfs_1.13-1_amd64.deb",
+      "bytes": 45714,
+      "sha256": "627033f1e3f6534165aba934f16fb5b1f25544ba9d79088c70087cde8b27cc42"
+    },
+    {
+      "path": "fuse-debs/fuse3_3.14.0-5build1_amd64.deb",
+      "source": "ubuntu",
+      "remote_path": "pool/main/f/fuse3/fuse3_3.14.0-5build1_amd64.deb",
+      "bytes": 25156,
+      "sha256": "1e5580eeb72e830f0b242254b2438669a94c9912abf1e2f188b2992f188cc995"
+    },
+    {
+      "path": "fuse-debs/libfuse3-3_3.14.0-5build1_amd64.deb",
+      "source": "ubuntu",
+      "remote_path": "pool/main/f/fuse3/libfuse3-3_3.14.0-5build1_amd64.deb",
+      "bytes": 83124,
+      "sha256": "3042159c6d7d4dcb3df9d49cd21e49ecb57f4ba8c4153a72102f512a4fc534a2"
+    }
+  ]
+}
