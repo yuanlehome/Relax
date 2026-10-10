@@ -87,6 +87,9 @@ class DockerSandbox:
             (self.root / name).mkdir()
         shutil.copy2(Path(__file__).with_name("sandbox_worker.py"), self.root / "control/worker.py")
         shutil.copy2(Path(__file__).with_name("claude_settings.json"), self.root / "control/settings.json")
+        shutil.copy2(
+            Path(__file__).parent / "scripts/install_task_runtime.sh", self.root / "control/install_task_runtime.sh"
+        )
         commands = ["set -euo pipefail"]
         targets: Path | None = None
         for index, upload in enumerate(metadata["sandbox_extra_params"]["nex_uploads"]):

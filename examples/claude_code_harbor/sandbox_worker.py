@@ -18,28 +18,6 @@ from pathlib import Path
 from typing import Any
 
 
-INSTALL_RUNTIME = r"""
-set -euo pipefail
-mkdir -p /opt/srt-bins /usr/local/lib/node_modules/@anthropic-ai
-cat /tmp/srt-bins-chunks/srt-bins-chunk-* | tar xzf - -C /opt/srt-bins
-chmod 755 /opt/srt-bins/bin/* /opt/srt-bins/real/*
-export PATH="/opt/srt-bins/bin:/usr/local/bin:$PATH"
-cat /tmp/cc-chunks/cc-chunk-* | tar xzf - -C /usr/local/lib/node_modules/@anthropic-ai
-cat /tmp/node-chunks/node-chunk-* | xz -dc | tar xf - -C /usr/local --strip-components=1
-cat /tmp/srt-npm-chunks/srt-npm-chunk-* | tar xzf - -C /usr/local/lib/node_modules
-ln -sfn ../lib/node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js /usr/local/bin/srt
-REAL=/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
-test -x "$REAL"
-cp -a "$REAL" /usr/local/bin/claude.real
-install -m 0755 /tmp/claude_srt_wrapper.sh /usr/local/bin/claude
-node --version
-/usr/local/bin/claude --version
-test -x /opt/srt-bins/bin/bwrap
-test -x /opt/srt-bins/bin/socat
-test -x /opt/srt-bins/bin/rg
-"""
-
-
 def execute(argv: list[str], *, log: str, timeout: float | None, **kwargs: Any) -> int:
     with Path(log).open("ab") as output:
         return subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, **kwargs).returncode
@@ -85,7 +63,9 @@ def cleanup_descendants() -> None:
 def run_command(command: dict[str, Any]) -> dict[str, Any]:
     operation = command["operation"]
     if operation == "initialize":
-        code = execute(["/bin/bash", "-c", INSTALL_RUNTIME], log="/logs/agent/setup.log", timeout=900)
+        code = execute(
+            ["/bin/bash", "/run/relax-control/install_task_runtime.sh"], log="/logs/agent/setup.log", timeout=900
+        )
         if code:
             raise RuntimeError(f"Runtime installation exited {code}")
         os.environ["PATH"] = "/opt/srt-bins/bin:/usr/local/bin:" + os.environ.get("PATH", "")
