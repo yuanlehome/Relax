@@ -94,6 +94,38 @@ and writes transfer evidence; it does not overwrite files in the code checkout.
 
 ## Build in the training image
 
+### Automatic startup on a fresh QS RayJob
+
+After configuring the mounted input and output variables above, the QS RayJob
+entrypoint can run all preparation and training steps in one foreground command:
+
+```bash
+cd "$CLOUD_ROOT/$REPO"
+python3 -u -m examples.claude_code_harbor.scripts.bootstrap_qs
+```
+
+Select **16 workers, 8 H800 each**, with the Relax training image. Mount the code,
+original data and all referenced assets, model, and new writable output roots on
+every node. Supply a fresh `DATA_ROOT`, `BUNDLE_DIR`, and `EXP_NAME`; set platform
+restart count to zero. The driver builds inputs/environment once on shared cloud
+storage, waits for all workers, verifies the hardware, then probes user namespaces
+and FUSE. Capable GPU workers run native Gym; other workers and the CPU head use
+fixed authenticated Gym forwarders. Both ports 27980 (local Gym) and 27981 (native
+uplink) must be available. `GYM_PORT` / `GYM_UPLINK_PORT` can override them.
+
+Ordinary zero-GPU Ray actors own the services for the lifetime of the foreground
+driver. Once every endpoint is ready, it runs the same `launch.sh` and waits for
+the training Ray job to reach a terminal state. It does not use a placeholder
+sleep, stop after five steps, resume existing outputs, or change the recipe's
+128 optimizer updates. Use a dedicated cluster: the existing training entrypoint
+performs its normal preflight cleanup there.
+
+`BUNDLE_DIR/bootstrap-status.json` records stages and numeric status. Private
+`bootstrap_logs/` contains preparation/install/launcher output; per-node service
+logs remain under `service_state/`. On a preparation failure, inspect the failed
+stage before choosing new output roots; the bootstrap never retries by overwriting
+a partial installation or restarting another job.
+
 Use Linux x86_64, the same Relax image as r5, and its system CPython 3.12. A
 different image must satisfy the checked-in base package contract; the installer
 fails on mismatch instead of upgrading training dependencies. Git with partial
