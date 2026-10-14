@@ -81,6 +81,25 @@ Gym 原位只检查，使用新的私有 check-log，不移动 venv、不改旧 
 
 这些不等于多节点 GPU 数值验收。最终 recovery 在服务验证期间失去 QS Pod，未获得当前实现的完整训练结果；该项仍未完成。
 
+### 已修复、保留与待验收
+
+此状态针对最新工作区和 `alignfix` release，不适用于旧 r5；本次文档提交仍不包含实现文件。
+
+| 项目                | 状态                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Loss 权重           | 已实现并启用业务 prompt 等权及完整 batch 的 CP/DP 归一化；CPU 数值通过，多卡效果待验收                        |
+| Timeout             | 已实现 7200 秒墙钟、暂停继续计时、保留真实轨迹并记 reward 0；没有真实 response 或普通 HTTP/CLI 故障仍报错     |
+| JSONL Unicode 分隔  | 已用 `split("\n")` 修复 `splitlines()` 的错误分隔；旧运行影响数量未知                                         |
+| BBS 初始化          | 新 prepare 保留原始 `150037` 方式，消除已记录的历史替换差异；执行环境整体等价未验收                           |
+| Drop 统计           | 未补齐：全同 reward 的 custom advantage 分支只写日志，不计入通用 dynamic-filter drop 指标；失败组去重分母缺失 |
+| 失败丢组            | 仍存在：单个受控 Session 失败可能丢掉整组 siblings，从后续题目补采；不是同题自动重试                          |
+| Reward 统计口径     | 仍需区分逻辑 Session 的 raw anchor 与按 context 加权的 metadata outcome；两者不能混作一条学习曲线             |
+| OOM/API400/输出超限 | 未逐项修复验证，不能视作随 loss/timeout 改动一起解决                                                          |
+| Staleness / GPU     | 按用户选择保留现状，不实现业务 token 版本门控或 224 GPU 分配                                                  |
+| 训练效果            | 当前实现尚无完整多卡训练和 reward 改善验收，不能称上述疑点全部解决                                            |
+
+源码依据包括 `relax/agentic/pipeline/reward.py` 的 custom advantage 与 final filter 分支、`relax/agentic/pipeline/runtime.py` 的整组收集/丢弃，以及 `relax/agentic/rollout.py` 的 metadata 聚合。完整解释和补证步骤见中英文指南的“修复状态与未完成项”及 reward 归因部分。
+
 本地证据根：
 
 ```text
@@ -88,15 +107,16 @@ R=${CONTROL_ROOT}
 C=R/recovery-run-2213885-20261014-1937
 ```
 
-| 文件                                                              | 用途                                      |
-| ----------------------------------------------------------------- | ----------------------------------------- |
-| `C/code-manifest.json`、`validation.json`、`parse-preflight.json` | 部署内容、CPU测试与真实参数契约证据       |
-| `C/monitor-state.json`                                            | 当前终止状态及历史 runtime 观察边界       |
-| `C/last-progress-before-qs-termination-20261014.json`             | 最后成功 runtime 快照                     |
-| `C/old-original-stopped-monitor-state.json`                       | 原始 7 更新的独立历史                     |
-| `C/old-alignment-failed-monitor-state.json`                       | 对齐 attempt 的 pre-main 失败历史         |
-| `R/alignment-run-2213885-20261014/terminal-failure-summary.json`  | list 零系数误判的根因                     |
-| `R/reward-baseline-2156263.json`                                  | 业务前 19 个实际入训 batch 的 reward 基线 |
+| 文件                                                              | 用途                                                                     |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `C/code-manifest.json`、`validation.json`、`parse-preflight.json` | 部署内容、CPU测试与真实参数契约证据                                      |
+| `C/monitor-state.json`                                            | 当前终止状态及历史 runtime 观察边界                                      |
+| `C/last-progress-before-qs-termination-20261014.json`             | 最后成功 runtime 快照                                                    |
+| `C/old-original-stopped-monitor-state.json`                       | 原始 7 更新的独立历史                                                    |
+| `C/old-alignment-failed-monitor-state.json`                       | 对齐 attempt 的 pre-main 失败历史                                        |
+| `R/alignment-run-2213885-20261014/terminal-failure-summary.json`  | list 零系数误判的根因                                                    |
+| `R/reward-baseline-2156263.json`                                  | 业务前 19 个实际入训 batch 的 reward 基线                                |
+| `R/r5-reward-diagnostic-20261014.json`                            | 历史 r5 窗口统计、业务筛选前后分母及归因限制；本地私有证据，不随文档上传 |
 
 Pod 缺失时不要执行会 assert 的 `C/read-progress.py`，也不要让 updater 把旧快照写成实时 RUNNING。运行恢复前先核对准确 child、checkpoint 和已完成进度，再确定新身份；不得直接重跑任何历史 submit/deploy/launch/stop/cleanup 脚本。
 
@@ -112,3 +132,22 @@ Pod 缺失时不要执行会 assert 的 `C/read-progress.py`，也不要让 upda
 - 业务 Job317717 / Trial2156263 在 10 月 9 日附近那次长 run 的 ClearML 链接仍未确认。QS 效果面板未接入、ClearML 搜索未匹配，不应编造链接或把 r5 链接充作业务链接。
 
 旧 `build-reward-comparison.py` 是原来 6 更新/8 生成轮的快照脚本，不能直接当作当前 run 的通用统计程序。后续分析仍应按同一实际入训 batch 的逻辑 trajectory reward 比较，并保留过滤、超时、任务构成与 context 加权的口径差异。
+
+### Reward 复核与剩余排查
+
+以下均为历史 r5 和业务运行各自实际入训 batch 的逻辑轨迹 reward，所有 batch 各含 256 个 Session；不是当前修复 attempt，也不是同题、同生成版本配对评测。
+
+| 窗口（step）       | r5         | 业务       |
+| ------------------ | ---------- | ---------- |
+| 前 5 批（0–4）     | 38.28125%  | 39.765625% |
+| 第 6–10 批（5–9）  | 33.90625%  | 39.21875%  |
+| 末 5 批（14–18）   | 39.140625% | 40.546875% |
+| 全部 19 批（0–18） | 37.232730% | 39.412007% |
+
+r5 中段下探、后段恢复；前五到末五批增加 0.859375 个百分点，业务增加 0.78125 个百分点。这个窗口不足以证明哪一方持续改善或退化。旧 r5 部署 manifest 对应 `ab845150d` 的 loss 路径按 token 加权，与业务 prompt 等权的差异已确认；其对 reward 差距的贡献尚未量化。最新 loss 修复不能回溯解释旧曲线为已对齐结果。
+
+业务前五批共检查 286 组/2288 条轨迹：reward 总和 621，筛选前均值 27.141608%；丢弃 14 个全对组、112 个全错组后，保留 160 组/1280 条轨迹，reward 总和 509，均值 39.765625%。组数与 reward 总和守恒已核对。这说明筛选会显著改变观察到的均值，不说明它已解释 r5 与业务的差距；r5 缺少对应的完整尝试分母。
+
+现有证据降低了“完全没更新”“advantage 符号反了”“大量 TIS token 被屏蔽”的优先级：旧 r5 前 19 次 `grad_norm` 均有限且正（约 0.137–0.200），TIS clip fraction 平均约 0.1806%；旧代码 CPU 检查中成功/失败优势符号正确，增加 context fanout 不改变 Session advantage。这些检查尚未证明后续所有 rollout 都使用了已发布的新权重。
+
+下一步应按 group 去重重建尝试、全对/全错/其他恒定 reward 过滤、执行失败、待完成与入训去向；联合统计筛选前后 reward sum/count、未知 outcome、任务类别、context 数和时长。错误日志次数和 OCI OOM 事件数不等于失败 Session/group 数。再按实际入训 batch 核对每题有效 token 数/loss 权重、模型生成版本年龄和权重发布，最后在可用资源与有效授权下用初始模型及现存 checkpoint 做固定题集评测。以上是待完成的鉴别步骤，当前没有唯一根因结论，也没有新训练效果已改善的结论。

@@ -188,6 +188,23 @@ The business allocation is 64 actor / 128 rollout / 32 eval GPUs, totaling 224; 
 
 Training packing budgets also differ: `8192` here versus `10000` in the reference. This is not full configuration equivalence and does not promise matching reward curves.
 
+## Repair status and remaining work
+
+This table describes the 2026-10-14 working-tree and `alignfix` deployment snapshot. Implementation status is separate from training-effect validation; these implementations are not committed with the documentation, and the changes do not retroactively apply to historical r5.
+
+| Issue | Current status | Validation boundary or remaining work |
+| --- | --- | --- |
+| Token-weighted loss differs from the business objective | Prompt-equal loss and closed-batch CP/DP normalization implemented and enabled | Numerical CPU checks passed; actual multi-GPU training and reward improvement remain unverified |
+| Timeout discards trajectories unlike the business behavior | 7200-second wall-clock cutoff implemented, including pauses; retain captured real trajectories, `TRUNCATED`, reward 0 | No real response still means an error; ordinary HTTP/CLI failures and the outer 10800-second safety cutoff are not converted into reward 0 |
+| Unicode separators break JSONL parsing | `run_agent.py` now uses `split("\n")` instead of `splitlines()` | Parser contract repaired; the number of affected historical r5 Sessions is unknown |
+| BBS initialization differs from original input | New preparation preserves the original `150037` initialization | Removes the documented historical substitution, without establishing end-to-end environment equivalence |
+| Missing zero-variance drop counts and failed-group denominators | Not yet completed | The equal-reward custom-advantage branch only logs filtering; execution failures can still discard and replenish whole groups |
+| Reward metrics use different weighting units | Metrics still need to be distinguished | `raw_reward` uses logical Session anchors; metadata `outcome_reward` is weighted by physical contexts |
+| Container OOM, API400, output-limit and other execution errors | Not individually repaired and validated | Loss/timeout changes do not establish their elimination; attribute errors by distinct Session/group |
+| Business token-version staleness | Existing implementation retained as selected | Still a queue-ahead constraint; actual training-token version ages have not been quantified |
+
+Saved validation covers 45 primary CPU tests: four loss tests (40 reports including subtests), 14 relay, 10 gym and 17 data tests, with no skips. The final validator fix was retested on the actual head CPU environment; unchanged suites retain their earlier evidence. Parse-only preflight of the actual recipe arguments passed without initializing CUDA. Multi-node GPU validation remains incomplete: the recovery attempt lost its QS Pods during service verification and produced no verified complete training result. These checks do not establish that the repairs explain the historical r5 reward gap or guarantee a rising new curve.
+
 ## Reading training progress and reward
 
 Read the latest timestamp, stage and `training_submission_id` in `BUNDLE_DIR/bootstrap-status.json`, then query that child through Jobs API. State fields are updated incrementally and historical fields can remain; an old health value is not a current observation.
@@ -212,6 +229,21 @@ Reward needs an equally precise unit:
 - GRPO uses the population standard deviation of logical Session rewards without an additive denominator epsilon. Equal-reward groups are filtered; division occurs only when the standard deviation exceeds `1e-6`, otherwise centered rewards are retained.
 - Prefer actual training-batch `raw_reward_trajectory_mean` when comparing with the business run. Generation rounds have different boundaries; dynamically filtered reward is not a fixed-evaluation success rate.
 - Falling reward describes worse sampled outcomes, but the curve alone cannot uniquely attribute the cause to loss, timeout or staleness. Compare zero-reward proportions, timeout/other failures, filtering/replenishment and task composition using the same batch boundaries.
+
+### Evidence still needed for reward attribution
+
+`examples/claude_code_harbor/advantage.py` returns `None` for equal-reward groups. In `relax/agentic/pipeline/reward.py`, `apply_custom_advantage()` only logs this filtering and does not call the generic `on_dynamic_filter_drop()`; the later `finalize_group()` filter branch does update that metric. A zero generic drop count therefore does not establish that no filtering occurred. This is an observability gap, not proof of incorrect training-filter behavior.
+
+Count execution failures separately from zero-variance filtering. A controlled `AgentExecutionError` can return `None` for one Session, causing Runtime to discard the entire group and clean up its siblings. The deficit is replenished with subsequent tasks rather than automatically retrying the same task. Container OOM events, error-log occurrences, Sessions and groups are different counting units. Long tasks or tasks prone to environment errors may be underrepresented, but current aggregates cannot quantify that bias.
+
+Prioritize the following numerical evidence. Correlate existing identities internally and export only deduplicated aggregates, without task text or identity values:
+
+1. One current disposition per attempted group: trained, filtered as all-correct, all-wrong, other constant reward, execution failure, or still pending. Classify failures by reason without counting a group twice.
+2. Prefilter and accepted reward sums/counts, unknown-reward counts, offered/accepted task-category counts, and context counts/durations stratified by outcome in the same observation window. Do not invent zero rewards for infrastructure failures with unknown outcomes.
+3. Unique valid token counts and loss weights per prompt in each actual training batch, to test whether long trajectories dominate training; also verify weight publication, generation versions and version ages at training time.
+4. Once resources and run authorization are available, evaluate the initial model and existing checkpoints on a fixed task set to separate capability changes from dynamic-selection effects.
+
+The operational handoff records the historical r5/business comparison for the first 19 actual training batches and its limits. The complete r5 attempted-group denominator is still missing, so accepted reward or a single drop curve cannot establish a unique cause.
 
 ## Failure, stopping and recovery
 

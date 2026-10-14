@@ -188,6 +188,23 @@ L = (1 / B_eff) * sum_context [sum_token(m' * token_loss) / max(D_p, 1)]
 
 训练 packing 预算也存在 `8192` 与业务 `10000` 的差别。因此本示例不代表与业务完全同配置，也不保证相同 reward 曲线。
 
+## 修复状态与未完成项
+
+下表对应 2026-10-14 的工作区及 `alignfix` 部署快照，区分实现状态与训练效果验收；它不表示这些实现已经随文档提交到 Git，也不回溯改变旧 r5 的行为。
+
+| 问题 | 当前状态 | 验证边界或剩余工作 |
+| --- | --- | --- |
+| Loss 按 token 加权，与业务不同 | 已实现并启用 prompt 等权、完整 batch 的 CP/DP 归一化 | 数值 CPU 检查通过；多卡实际训练及 reward 改善尚未验收 |
+| 超时丢轨迹，与业务不同 | 已实现 7200 秒墙钟截止，暂停期间继续计时；保留已捕获的真实轨迹、`TRUNCATED`、reward 0 | 没有真实 response 时仍报错；普通 HTTP/CLI 故障及外层 10800 秒安全截止不伪装成 reward 0 |
+| Unicode 分隔符导致 JSONL 解析失败 | `run_agent.py` 已用 `split("\n")` 替换 `splitlines()` | 修复解析契约；旧 r5 受影响的独立 Session 数量未知 |
+| BBS 初始化与原始输入不同 | 新 prepare 保留原始 `150037` 初始化方式 | 消除已记录的历史替换差异，不代表整条执行环境已完成等价验收 |
+| 零方差 drop 漏计、失败组缺少完整分母 | 尚未补齐 | 全同 reward 的 custom advantage 分支只写过滤日志；执行失败仍可能丢整组并补采 |
+| reward 指标加权单位不同 | 仍需区分指标 | `raw_reward` 按逻辑 Session anchor；metadata 的 `outcome_reward` 按物理 context 加权 |
+| 容器 OOM、API400、输出超限等执行异常 | 尚未逐项修复并验证 | loss/timeout 改动不能证明这些异常已消除；需要按独立 Session/group 归因 |
+| 业务 token 版本 staleness | 按本次选择保持现有实现 | 仍是队列领先限制；尚未量化实际入训 token 的版本年龄 |
+
+保存的验证包含 45 个 CPU 主测试：loss 4（含 subtests 的报告数为 40）、relay 14、gym 10、data 17，无 skip。最后的 validator 修复在实际 head CPU 环境重测，其他未改套件沿用此前证据；实际 recipe 参数的 parse-only preflight 通过且未初始化 CUDA。多节点 GPU 验证未完成：恢复 attempt 在服务验证期间失去 QS Pod，未取得完整训练结果。因此不能宣称这些修复已解释旧 r5 的 reward 差距，或保证新曲线持续上涨。
+
 ## 如何看训练与 reward
 
 先读 `BUNDLE_DIR/bootstrap-status.json` 的最新时间、stage 和 `training_submission_id`，再通过 Jobs API 查询这个 child。状态文件采用增量更新，历史字段可能仍存在；不能把旧的健康字段当作当前状态。
@@ -212,6 +229,21 @@ reward 的统计单位同样需要区分：
 - GRPO 使用逻辑 Session 的总体标准差，无附加 denominator epsilon；全组 reward 相同则过滤。标准差大于 `1e-6` 才除，否则保留 centered reward。
 - 对照业务应优先使用实际入训 batch 的 `raw_reward_trajectory_mean`。生成轮与入训 batch 边界不同；动态筛选后的 reward 也不是固定评测成功率。
 - reward 下降能描述采样结果变差，但仅凭一条曲线不能唯一归因于 loss、timeout 或 staleness。应对照同一 batch 边界下的零奖励比例、超时与其他失败、筛选/补采比例及任务构成。
+
+### Reward 归因还缺什么
+
+`examples/claude_code_harbor/advantage.py` 对全同 reward 的组返回 `None`。`relax/agentic/pipeline/reward.py` 的 `apply_custom_advantage()` 仅记录过滤日志，没有调用通用 `on_dynamic_filter_drop()`；后面的 `finalize_group()` 过滤分支才会更新该指标。因此通用 drop 指标为零不能证明未筛选，这是观测缺口，不是已证实的训练过滤错误。
+
+执行失败与零方差过滤必须分别计数。受控 `AgentExecutionError` 可以使一个 Session 返回 `None`，Runtime 随后丢掉整个组并清理其余 siblings；缺口会从后续题目补采，并非自动重试同题。容器 OOM 事件数、错误日志出现次数、Session 数和 group 数不能互换。长任务或易触发环境异常的题可能因此欠采样，但现有汇总不足以量化这种偏差。
+
+优先补齐以下数值证据，内部按已有身份关联，对外仅输出去重汇总，不导出任务文本或身份值：
+
+1. 每组尝试的当前去向：入训、全对过滤、全错过滤、其他恒定 reward 过滤、执行失败、仍待完成；失败再按原因分类，避免同一组重复计数。
+2. 同一观察窗口的筛选前后 reward sum/count、未知 reward 数量、任务类别的 offered/accepted 数量，以及按 outcome 分层的 context 数和时长。未取得 reward 的基础设施失败不能擅自填成零。
+3. 按实际入训 batch 聚合每题的唯一有效 token 数与 loss 权重，检查长轨迹是否主导训练；同时核对权重发布、生成版本和入训时的版本年龄。
+4. 在资源可用且运行授权满足后，用初始模型与现存 checkpoint 对固定题集评测，将能力变化与动态筛选造成的分布变化区分开。
+
+历史 r5 与业务前 19 个实际入训 batch 的数字及限制见运行交接文档。当前缺少 r5 完整尝试分母，不能仅由 accepted reward 或某一条 drop 曲线给出唯一根因。
 
 ## 停止、失败与恢复
 
