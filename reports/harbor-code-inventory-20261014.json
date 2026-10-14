@@ -1,0 +1,1368 @@
+{
+  "snapshot_date": "2026-10-14",
+  "base_commit": "b582cfc811ed6dc9b7bb085cc3e07488993eb800",
+  "source_worktree": "${LOCAL_REPO}",
+  "branch": "codex/claude-code-agentic-128xh800",
+  "scope": "128GPU; prompt loss; 7200 wall-clock timeout; unchanged staleness",
+  "implementation_published_with_this_document": false,
+  "release_manifest_sha256": "e88446c396651480a86ef8b882193b017b1714593dbd8e42ec99b0fcd1c3a863",
+  "release_file_count": 1608,
+  "release_symlink_count": 12,
+  "release_overlays": [
+    "examples/claude_code_harbor/ENVIRONMENT.md",
+    "examples/claude_code_harbor/nemo_agent.py",
+    "examples/claude_code_harbor/relay.py",
+    "examples/claude_code_harbor/run_agent.py",
+    "examples/claude_code_harbor/scripts/bootstrap_qs.py",
+    "examples/claude_code_harbor/scripts/build_gym_environment.py",
+    "examples/claude_code_harbor/scripts/harbor.env.example",
+    "examples/claude_code_harbor/scripts/oci_paths.py",
+    "examples/claude_code_harbor/scripts/prepare_data.py",
+    "examples/claude_code_harbor/scripts/run-harbor.sh",
+    "examples/claude_code_harbor/scripts/run-qwen36-35B-A3B-128xgpu.sh",
+    "examples/claude_code_harbor/scripts/source-assets.json",
+    "examples/claude_code_harbor/scripts/verify_oci.py",
+    "examples/claude_code_harbor/training_data.py",
+    "relax/backends/megatron/actor.py",
+    "relax/backends/megatron/cp_utils.py",
+    "relax/backends/megatron/data.py",
+    "relax/backends/megatron/loss.py",
+    "relax/backends/megatron/model.py",
+    "relax/backends/megatron/prompt_loss.py",
+    "relax/utils/arguments.py",
+    "relax/utils/data/stream_dataloader.py",
+    "relax/utils/utils.py",
+    "repro/claude-code-harbor-r5/scripts/start_node.sh",
+    "tests/backends/megatron/test_prompt_equal_loss.py",
+    "tests/examples/claude_code_harbor/test_compaction_contract.py",
+    "tests/examples/claude_code_harbor/test_local_relay.py",
+    "tests/examples/claude_code_harbor/test_oci_lifecycle.py",
+    "tests/examples/claude_code_harbor/test_training_data.py"
+  ],
+  "final_validator_fix": [
+    "relax/backends/megatron/prompt_loss.py",
+    "tests/backends/megatron/test_prompt_equal_loss.py"
+  ],
+  "files": [
+    {
+      "path": "examples/claude_code_harbor/ENVIRONMENT.md",
+      "size_bytes": 22386,
+      "sha256": "ee28e59a406a641d75329e09d58331eb11dc22a3088aa9bb1457949c8758beb4",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "ee28e59a406a641d75329e09d58331eb11dc22a3088aa9bb1457949c8758beb4",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/advantage.py",
+      "size_bytes": 2120,
+      "sha256": "d68002550bd7ae220ecf470f288faecee974b801bf538edb13cadf67455a5d61",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d68002550bd7ae220ecf470f288faecee974b801bf538edb13cadf67455a5d61",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/asset_paths.py",
+      "size_bytes": 1139,
+      "sha256": "5fc2e8253c65d1aea9e29c30b20da0a403b811ad069265abb48cbce349418920",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "5fc2e8253c65d1aea9e29c30b20da0a403b811ad069265abb48cbce349418920",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/claude_settings.json",
+      "size_bytes": 166,
+      "sha256": "f7bd61b47b8e2626e753fe517832c7fd325a879237bfd544ea67c717a5d9dd48",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "f7bd61b47b8e2626e753fe517832c7fd325a879237bfd544ea67c717a5d9dd48",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/contexts.py",
+      "size_bytes": 5886,
+      "sha256": "b15abdedf2fc737bc020482e0e7f872bc26f8b60f631937988516588f3556c8c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "b15abdedf2fc737bc020482e0e7f872bc26f8b60f631937988516588f3556c8c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/gym_service.py",
+      "size_bytes": 4906,
+      "sha256": "0149268a8d9abc73b484f16bdb7ee61309e6adf68c4ea6612bea15494a29690b",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "0149268a8d9abc73b484f16bdb7ee61309e6adf68c4ea6612bea15494a29690b",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/mimo_git_reflog.patch",
+      "size_bytes": 1402,
+      "sha256": "6c5cb51c0e8db7d9103e0fff6b413941f2ca1b2de373ef4f278c0b49acaf1f48",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "6c5cb51c0e8db7d9103e0fff6b413941f2ca1b2de373ef4f278c0b49acaf1f48",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/nemo_agent.py",
+      "size_bytes": 11948,
+      "sha256": "fc5d5f4431fd3b213ee0a313e43557b2c9a89d2fe4089ce1b227efe6d41ba7a2",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "fc5d5f4431fd3b213ee0a313e43557b2c9a89d2fe4089ce1b227efe6d41ba7a2",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/oci.py",
+      "size_bytes": 11800,
+      "sha256": "f9197d1db1e5efdff602a46ccac14d5097bc136ccd0f5b6d9e1cb4be8736fdd4",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "f9197d1db1e5efdff602a46ccac14d5097bc136ccd0f5b6d9e1cb4be8736fdd4",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/relay.py",
+      "size_bytes": 14777,
+      "sha256": "7474bdf04a89bff35d77ef85bf93faeb170477e8f991f9b6e46f335536928031",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "7474bdf04a89bff35d77ef85bf93faeb170477e8f991f9b6e46f335536928031",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/request_normalization.py",
+      "size_bytes": 2872,
+      "sha256": "f68dc516aaa7f6ef2faac53e7f253f9c52c8f9914df627ac05bac755640c4f47",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "f68dc516aaa7f6ef2faac53e7f253f9c52c8f9914df627ac05bac755640c4f47",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/run_agent.py",
+      "size_bytes": 3788,
+      "sha256": "3bedfac2c048d261d145251fb0abd6eaec477dcb494f20f3956eba5ecda73958",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "3bedfac2c048d261d145251fb0abd6eaec477dcb494f20f3956eba5ecda73958",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/sandbox_worker.py",
+      "size_bytes": 8758,
+      "sha256": "65f77eed24162a7d0cc03801065b0eb32a810d7759d092bf484d96d5c4ec49c0",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "65f77eed24162a7d0cc03801065b0eb32a810d7759d092bf484d96d5c4ec49c0",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/bootstrap_qs.py",
+      "size_bytes": 27996,
+      "sha256": "4e1d09af46de8d3aa372f35833934a32fd25af3cb790b874630c8c10809b26a7",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "4e1d09af46de8d3aa372f35833934a32fd25af3cb790b874630c8c10809b26a7",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/build_gym_environment.py",
+      "size_bytes": 9378,
+      "sha256": "89f486ee8c8b05b7c512c7edcdef9165d43382201832810aca799e46fb707deb",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "89f486ee8c8b05b7c512c7edcdef9165d43382201832810aca799e46fb707deb",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/check_gym_environment.py",
+      "size_bytes": 2890,
+      "sha256": "699cb1cf93bfde88fc0f578ae96a2900f64e694248d6adb50d1f570a7d259bd2",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "699cb1cf93bfde88fc0f578ae96a2900f64e694248d6adb50d1f570a7d259bd2",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/cloud_paths.sh",
+      "size_bytes": 622,
+      "sha256": "1994d45b5b31ebc8442594412d95e5ef2d4bc21d6bed3c8329110a28c90e1123",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "1994d45b5b31ebc8442594412d95e5ef2d4bc21d6bed3c8329110a28c90e1123",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/fetch_oci_packages.py",
+      "size_bytes": 4795,
+      "sha256": "ec31aaf1291e0c3823e29eca6507a4f823b11a246269a1dd8b817fcc5ee71e44",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ec31aaf1291e0c3823e29eca6507a4f823b11a246269a1dd8b817fcc5ee71e44",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/forward_gym.py",
+      "size_bytes": 3035,
+      "sha256": "a8b29290e37afe658ddfd124515b5f00a1d6fe8bfba33a36e6b12372480513d9",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "a8b29290e37afe658ddfd124515b5f00a1d6fe8bfba33a36e6b12372480513d9",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/gym-base-requirements.txt",
+      "size_bytes": 1305,
+      "sha256": "3b698dad6df62a6d4d51d10c9225bb7342f33f46efdc1504418f0ba86f7784f1",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "3b698dad6df62a6d4d51d10c9225bb7342f33f46efdc1504418f0ba86f7784f1",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/gym-requirements.txt",
+      "size_bytes": 601,
+      "sha256": "ff6e28f28bf69462c7ae3a652540474a3cb6881a6985bff173a25aee54ba9433",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ff6e28f28bf69462c7ae3a652540474a3cb6881a6985bff173a25aee54ba9433",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/harbor.env.example",
+      "size_bytes": 1694,
+      "sha256": "9706b3e43ffe297526d74931b302bb6e2162a8f3c36d8f6140c5b598c6124414",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "9706b3e43ffe297526d74931b302bb6e2162a8f3c36d8f6140c5b598c6124414",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/install_gym_runtime.sh",
+      "size_bytes": 309,
+      "sha256": "a221dabbb796f3b9be1ffeb4cc2dd070af32fcef13303d973e302d7f4c0a45bd",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "a221dabbb796f3b9be1ffeb4cc2dd070af32fcef13303d973e302d7f4c0a45bd",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/install_oci_runtime.sh",
+      "size_bytes": 5394,
+      "sha256": "2950d39f6a8061e5e9f58bed4dfcfece4434054c9cfd104514b878abeb4f7913",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2950d39f6a8061e5e9f58bed4dfcfece4434054c9cfd104514b878abeb4f7913",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/install_task_runtime.sh",
+      "size_bytes": 2137,
+      "sha256": "6876e86eef9038423d8554c414674c22bd8c9b8cd32bbe3c27990b856244133d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "6876e86eef9038423d8554c414674c22bd8c9b8cd32bbe3c27990b856244133d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/oci-packages.json",
+      "size_bytes": 1239,
+      "sha256": "02813464a147d6c33265deb4434a53b32d5e741be2c8cf00f599dc8cb896b537",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "02813464a147d6c33265deb4434a53b32d5e741be2c8cf00f599dc8cb896b537",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/oci_paths.py",
+      "size_bytes": 1301,
+      "sha256": "4a2a3c80619f4f90ad171ed1d6ae8b7a5213efe9e962e7693722a3d54f752769",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "4a2a3c80619f4f90ad171ed1d6ae8b7a5213efe9e962e7693722a3d54f752769",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/prepare_data.py",
+      "size_bytes": 16770,
+      "sha256": "8e7c712635c3cb4ecb885586a48e8f442bf6147dbd97b427e8b054ad8cef8d27",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "8e7c712635c3cb4ecb885586a48e8f442bf6147dbd97b427e8b054ad8cef8d27",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/prepare_data_via_qs.py",
+      "size_bytes": 12195,
+      "sha256": "361583c3c1285f6d5b85afbbd0879d7511bffcf5a53a73767f6cc9a57ae268a0",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "361583c3c1285f6d5b85afbbd0879d7511bffcf5a53a73767f6cc9a57ae268a0",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/run-harbor.sh",
+      "size_bytes": 1686,
+      "sha256": "db70c37f9a3a27b96068496c6078b9b650ae49be39410295713b976598700b36",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "db70c37f9a3a27b96068496c6078b9b650ae49be39410295713b976598700b36",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/run-qwen36-35B-A3B-128xgpu.sh",
+      "size_bytes": 9677,
+      "sha256": "45690193c00a83650e4bae29757eb1ce652652bf79774344d3a568b888a4fa7e",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "45690193c00a83650e4bae29757eb1ce652652bf79774344d3a568b888a4fa7e",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/source-assets.json",
+      "size_bytes": 1064,
+      "sha256": "5d0f3cefc24b59b450089db550f63edde292df7cd0d1768f73cdc20a8fcf0e21",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "5d0f3cefc24b59b450089db550f63edde292df7cd0d1768f73cdc20a8fcf0e21",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/start_gym.sh",
+      "size_bytes": 1129,
+      "sha256": "b09077d61019a06269de84c888434cb29c8de75b5782f43edc5312ac7e7b7e11",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "b09077d61019a06269de84c888434cb29c8de75b5782f43edc5312ac7e7b7e11",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/verify_oci.py",
+      "size_bytes": 12401,
+      "sha256": "9d7d5df7da0165d6f33fcca2f9c4a60e4528ace2adff9454c86fd838db6c2a55",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "9d7d5df7da0165d6f33fcca2f9c4a60e4528ace2adff9454c86fd838db6c2a55",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/claude_code_harbor/training_data.py",
+      "size_bytes": 8535,
+      "sha256": "5fbca04c94c57402b90e4523356f368a237b3ff53ffa82ba6128ef8e86b6ec01",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "5fbca04c94c57402b90e4523356f368a237b3ff53ffa82ba6128ef8e86b6ec01",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "examples/nemo_gym_agentic/__init__.py",
+      "size_bytes": 57,
+      "sha256": "9d07fdad17c8e1baf40b9d1970ed94be5d0edb821d08f5e501d9d0573ffe561e",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "9d07fdad17c8e1baf40b9d1970ed94be5d0edb821d08f5e501d9d0573ffe561e",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/app/__init__.py",
+      "size_bytes": 125,
+      "sha256": "5ccf7afbbb988d165fd545e6ff6445f17dfc549bcfa3ba6ba2a25c24f35646b4",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "5ccf7afbbb988d165fd545e6ff6445f17dfc549bcfa3ba6ba2a25c24f35646b4",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/app/client.py",
+      "size_bytes": 16610,
+      "sha256": "2c9070a90ba6201adbf0f3ecfcb4e2506627740bf1c3efe9740b34b46e7d11e8",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2c9070a90ba6201adbf0f3ecfcb4e2506627740bf1c3efe9740b34b46e7d11e8",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/app/protocol.py",
+      "size_bytes": 14370,
+      "sha256": "c369d3c7bca99cfa1963d26c44676c67d2c8ba3a11cd292242a58b361ac800fb",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "c369d3c7bca99cfa1963d26c44676c67d2c8ba3a11cd292242a58b361ac800fb",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/app/result.py",
+      "size_bytes": 6037,
+      "sha256": "4b23f730c5cf6767fcdd60ea62484627a33286d8ba28fc52cfeff2ad9db40f43",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "4b23f730c5cf6767fcdd60ea62484627a33286d8ba28fc52cfeff2ad9db40f43",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/calendar/prepare_calendar.sh",
+      "size_bytes": 3149,
+      "sha256": "2f81af1d0f3f10448317dd555d36224fb70519b3d750b3cc393bd0a2b2fe16e2",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2f81af1d0f3f10448317dd555d36224fb70519b3d750b3cc393bd0a2b2fe16e2",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/calendar/run-qwen3-4B-8xgpu-nemo-gym-calendar.sh",
+      "size_bytes": 5064,
+      "sha256": "d0114521e299b7e1e4194caa0a7d48a6d1fc8dbdac29ff7f6dada27e4cd876bc",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d0114521e299b7e1e4194caa0a7d48a6d1fc8dbdac29ff7f6dada27e4cd876bc",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/calendar/start_calendar_gym.sh",
+      "size_bytes": 3802,
+      "sha256": "e2f8cdcfe1595c66e8203ba847463f4bd11f580cdc616da510b12f857c87a75c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "e2f8cdcfe1595c66e8203ba847463f4bd11f580cdc616da510b12f857c87a75c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/calendar/verify_calendar.py",
+      "size_bytes": 3250,
+      "sha256": "c8925b98c8812471e63443a1e8b4bd3b260ec3eaae02114df564fb7444a04275",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "c8925b98c8812471e63443a1e8b4bd3b260ec3eaae02114df564fb7444a04275",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/gsm8k/prepare_gsm8k.sh",
+      "size_bytes": 893,
+      "sha256": "e95d96b3bcd0c26f2999fad2423124e56239e1066f1b46c88186d47cccd4feb2",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "e95d96b3bcd0c26f2999fad2423124e56239e1066f1b46c88186d47cccd4feb2",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/gsm8k/run-qwen3-4B-8xgpu-nemo-gym.sh",
+      "size_bytes": 6778,
+      "sha256": "b71dae874e33fd462b5546f5db0081a4977688e6de8ff02e7016fca46078de27",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "b71dae874e33fd462b5546f5db0081a4977688e6de8ff02e7016fca46078de27",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/gsm8k/start_gsm8k_gym.sh",
+      "size_bytes": 2496,
+      "sha256": "ccf346d8715333789de2eb07fc428d5670f6c0ac3821157b4276cb5942679a4e",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ccf346d8715333789de2eb07fc428d5670f6c0ac3821157b4276cb5942679a4e",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/gsm8k/verify_gsm8k.py",
+      "size_bytes": 2951,
+      "sha256": "e577d67fb16ea762a823371896d8e3cf10442ebd8fdf3aeb4536dae0be44f8ee",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "e577d67fb16ea762a823371896d8e3cf10442ebd8fdf3aeb4536dae0be44f8ee",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/multienv-math-workplace/prepare_multienv.sh",
+      "size_bytes": 4664,
+      "sha256": "1035cd7d3d86426eff58e464d72a707f25626fd4b8f9b5d91f816708a72a4cce",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "1035cd7d3d86426eff58e464d72a707f25626fd4b8f9b5d91f816708a72a4cce",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/multienv-math-workplace/run-qwen3-4B-8xgpu-nemo-gym-multienv.sh",
+      "size_bytes": 6527,
+      "sha256": "d7820719fba8d6debddcb52e0b713e9191f5cbae806f6d5438e69c2604e40c33",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d7820719fba8d6debddcb52e0b713e9191f5cbae806f6d5438e69c2604e40c33",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/multienv-math-workplace/start_multienv_gym.sh",
+      "size_bytes": 5715,
+      "sha256": "06d43e0ad48513ff02d039d831086fc1925c59f9434bb72f50aefede524608a0",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "06d43e0ad48513ff02d039d831086fc1925c59f9434bb72f50aefede524608a0",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/multienv-math-workplace/start_multienv_gym_remote.sh",
+      "size_bytes": 7165,
+      "sha256": "51a759b1d5b3e15df62957e0e74bfa513c7fd8be3da62789a8ede14281e6187b",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "51a759b1d5b3e15df62957e0e74bfa513c7fd8be3da62789a8ede14281e6187b",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/prepare_r2e_gym.py",
+      "size_bytes": 6054,
+      "sha256": "0b3dd7cac7fce56b98d8d2e1c4bdaa85647afb2c43a56783e2b1ee28e2c5c93d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "0b3dd7cac7fce56b98d8d2e1c4bdaa85647afb2c43a56783e2b1ee28e2c5c93d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/prepare_r2e_gym.sh",
+      "size_bytes": 4716,
+      "sha256": "5c7ca0cbab3886c324b04787004274f1ba9d10023b9d166640854664c7c8239f",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "5c7ca0cbab3886c324b04787004274f1ba9d10023b9d166640854664c7c8239f",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/run-qwen35-9B-8xgpu-nemo-gym-r2e.sh",
+      "size_bytes": 4880,
+      "sha256": "f89839354f1d6ba8aa28c0ce1afe5f6105e5b2677596152e7652ec02888ddab5",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "f89839354f1d6ba8aa28c0ce1afe5f6105e5b2677596152e7652ec02888ddab5",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh",
+      "size_bytes": 21505,
+      "sha256": "2b7dcfddaf9ca37a04691de9afe9dd21e03affe5faf8eddcfb661356220e1389",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2b7dcfddaf9ca37a04691de9afe9dd21e03affe5faf8eddcfb661356220e1389",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_remote.sh",
+      "size_bytes": 14580,
+      "sha256": "7a2fbc92ac238a216bdfdfda6467fe7a3ada7ccbb6b169f4c5959937dd62495c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "7a2fbc92ac238a216bdfdfda6467fe7a3ada7ccbb6b169f4c5959937dd62495c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/submit_r2e_gym.sh",
+      "size_bytes": 3804,
+      "sha256": "1a71848ce594257f051036886abb68fc36fdb209de08cada39a6e78b5e2cd2cb",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "1a71848ce594257f051036886abb68fc36fdb209de08cada39a6e78b5e2cd2cb",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/verify_openhands_history.py",
+      "size_bytes": 6104,
+      "sha256": "b84e913b6bb333f60ddeaa4e907da9fec0af307311b70f625491dcdc293a991c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "b84e913b6bb333f60ddeaa4e907da9fec0af307311b70f625491dcdc293a991c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/r2e-gym/verify_r2e_gym_trial.py",
+      "size_bytes": 4162,
+      "sha256": "c2e57f490fbdeaa89b18f87b4e733c335932e630d1f4456325d5a68bef326be4",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "c2e57f490fbdeaa89b18f87b4e733c335932e630d1f4456325d5a68bef326be4",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/configs/claude_settings.json",
+      "size_bytes": 1125,
+      "sha256": "5fde176ac4c646bba4e008fe6126910d6de9d7ca8b283bbc1d872bb74793fb6c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "5fde176ac4c646bba4e008fe6126910d6de9d7ca8b283bbc1d872bb74793fb6c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/prepare_reasoning_gym_cc.sh",
+      "size_bytes": 7587,
+      "sha256": "d3358ba3eb6ee451723f17444615db9a868c0cabf5f11d7961a853e8b840fc2c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d3358ba3eb6ee451723f17444615db9a868c0cabf5f11d7961a853e8b840fc2c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/run-qwen3-4B-8xgpu-nemo-gym-reasoning-gym-cc.sh",
+      "size_bytes": 6753,
+      "sha256": "6d88c8c9871c46b4f3456c29d22209b35645caae0ae4f5c545bddfaa06e98a50",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "6d88c8c9871c46b4f3456c29d22209b35645caae0ae4f5c545bddfaa06e98a50",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/start_reasoning_gym_cc_gym.sh",
+      "size_bytes": 7115,
+      "sha256": "eb94bab3c882183d50ddf7a32c0203f07f7e5920fedb28a52b921a8fba1df7b2",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "eb94bab3c882183d50ddf7a32c0203f07f7e5920fedb28a52b921a8fba1df7b2",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/start_reasoning_gym_cc_gym_remote.sh",
+      "size_bytes": 8006,
+      "sha256": "a9cb66bf89e6a0cbb5800dea180715e56a521179ec51ca21829571697dc81eb8",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "a9cb66bf89e6a0cbb5800dea180715e56a521179ec51ca21829571697dc81eb8",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/reasoning-gym-cc/verify_reasoning_gym_cc_trial.py",
+      "size_bytes": 10064,
+      "sha256": "d3bc9049461c7d43989dc76a2718ed2b1249c655fcec4055a5bc645b107bdcb3",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d3bc9049461c7d43989dc76a2718ed2b1249c655fcec4055a5bc645b107bdcb3",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/prepare_workplace_assistant.sh",
+      "size_bytes": 1503,
+      "sha256": "7275ad2516144b03cfac5f675a8061b9d61cee5de980b2b43f3e4f75ff9efc80",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "7275ad2516144b03cfac5f675a8061b9d61cee5de980b2b43f3e4f75ff9efc80",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/run-qwen3-4B-8xgpu-nemo-gym-workplace-hybrid-async.sh",
+      "size_bytes": 5482,
+      "sha256": "445c7bd12606b9d1e20ab3beda5c3ddd932a5ae7015e7da1d2b2dad0eca8bb1f",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "445c7bd12606b9d1e20ab3beda5c3ddd932a5ae7015e7da1d2b2dad0eca8bb1f",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/run-qwen3-4B-8xgpu-nemo-gym-workplace.sh",
+      "size_bytes": 5123,
+      "sha256": "416120b9c35c036949a69541d6ecf42e989a1565a73253729573394e010b2439",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "416120b9c35c036949a69541d6ecf42e989a1565a73253729573394e010b2439",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/start_workplace_assistant_gym.sh",
+      "size_bytes": 4592,
+      "sha256": "eef670e21c00f4bb8c2b7de6f451a12d5a71618cf07ec0593087aaa4a93a32c9",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "eef670e21c00f4bb8c2b7de6f451a12d5a71618cf07ec0593087aaa4a93a32c9",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/start_workplace_assistant_gym_remote.sh",
+      "size_bytes": 8276,
+      "sha256": "cb7c5a30e740a9a5ad77bdb87c15f57fa4ed9a4c04aca0f7802478267b8a8d25",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "cb7c5a30e740a9a5ad77bdb87c15f57fa4ed9a4c04aca0f7802478267b8a8d25",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/verify_workplace_assistant.py",
+      "size_bytes": 3764,
+      "sha256": "5fa36a3c9459ca275f52a56023410d3e667eb7a6a9f34622119c53d19b2a2f6a",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "5fa36a3c9459ca275f52a56023410d3e667eb7a6a9f34622119c53d19b2a2f6a",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/recipes/workplace-assistant/verify_workplace_assistant_trial.py",
+      "size_bytes": 9830,
+      "sha256": "0e740b704b2bf6e13cf62f1926bf317db69a6508f71df2a499d7b31c9f9f6a62",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "0e740b704b2bf6e13cf62f1926bf317db69a6508f71df2a499d7b31c9f9f6a62",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/scripts/convert_dataset.py",
+      "size_bytes": 4658,
+      "sha256": "fd2158932ebde6e1773ca9e38f81edb390e91a49d6200f19580a3f1ab05d880d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "fd2158932ebde6e1773ca9e38f81edb390e91a49d6200f19580a3f1ab05d880d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/scripts/run_agent_app.sh",
+      "size_bytes": 756,
+      "sha256": "f82e5ba64c96c9ac4f9699936459f5cf6fa4f8caff3a305257e7179c63270b38",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "f82e5ba64c96c9ac4f9699936459f5cf6fa4f8caff3a305257e7179c63270b38",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/scripts/run_gateway.sh",
+      "size_bytes": 821,
+      "sha256": "d3c26b744c591a734da7967c370b2e4fd589399f67ac876c41fcbf0ab8a50b52",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d3c26b744c591a734da7967c370b2e4fd589399f67ac876c41fcbf0ab8a50b52",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/scripts/run_training.sh",
+      "size_bytes": 685,
+      "sha256": "63e7768b29c255a92ca295930c3b8834cf5606917cdc7d93ea6848e74aa8c5a0",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "63e7768b29c255a92ca295930c3b8834cf5606917cdc7d93ea6848e74aa8c5a0",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/__init__.py",
+      "size_bytes": 128,
+      "sha256": "59c8220c590f995b8764a93dd0d69a19cf318cb44da92ab9e43451171271d576",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "59c8220c590f995b8764a93dd0d69a19cf318cb44da92ab9e43451171271d576",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/app.py",
+      "size_bytes": 11007,
+      "sha256": "ce2013fdb0395cf6126fb1ab322de6727d042e8811a3a3803ca7a622161e95ad",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ce2013fdb0395cf6126fb1ab322de6727d042e8811a3a3803ca7a622161e95ad",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/callback_provider.py",
+      "size_bytes": 8535,
+      "sha256": "813dbc944b334eeed8152cef805b015673ce94744656f25b8674ee4dec15d441",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "813dbc944b334eeed8152cef805b015673ce94744656f25b8674ee4dec15d441",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/config.py",
+      "size_bytes": 14911,
+      "sha256": "97210a3b484989bfc8ff6ee549e6232a163cc95cc8969934bc12407f8d1b7544",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "97210a3b484989bfc8ff6ee549e6232a163cc95cc8969934bc12407f8d1b7544",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/nemo_gym_gateway_model/app.py",
+      "size_bytes": 1375,
+      "sha256": "2f25d7d1e8a932105af78a3ce5e81ecd811d57a5d0b227ee6aff0110236f9223",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2f25d7d1e8a932105af78a3ce5e81ecd811d57a5d0b227ee6aff0110236f9223",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/claude_code_agent_cleanup.patch",
+      "size_bytes": 7079,
+      "sha256": "ab3bfe76dc88b12408d9c210f9eb54a2916453220ee43ad60729bc67fa9990d0",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ab3bfe76dc88b12408d9c210f9eb54a2916453220ee43ad60729bc67fa9990d0",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/claude_code_agent_pinned_install.patch",
+      "size_bytes": 723,
+      "sha256": "1282cb4c645bbe088aa5960fbc0845a061122291d43cc985867b3781b6b750d2",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "1282cb4c645bbe088aa5960fbc0845a061122291d43cc985867b3781b6b750d2",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/nemo_gym_http_error_traceback.patch",
+      "size_bytes": 362,
+      "sha256": "4c58f393cbf162234be1c54cc9d0891dc5c0fc54dcd75728b27e8ca541c4fd12",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "4c58f393cbf162234be1c54cc9d0891dc5c0fc54dcd75728b27e8ca541c4fd12",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/openhands_platform_release.patch",
+      "size_bytes": 1052,
+      "sha256": "542394d3cdf7e682c5317d0ca51271dde4048a186ef2f36b920885d23793cc3b",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "542394d3cdf7e682c5317d0ca51271dde4048a186ef2f36b920885d23793cc3b",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/openhands_r2e_runtime.patch",
+      "size_bytes": 4764,
+      "sha256": "d7e29cbc68354e24d651c8614d6a9f957c80132598b72bb9805f1280d4a2c2fe",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d7e29cbc68354e24d651c8614d6a9f957c80132598b72bb9805f1280d4a2c2fe",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/openhands_r2e_runtime_setup.patch",
+      "size_bytes": 755,
+      "sha256": "804345d843feb24cfda1e2c871026d19b93741ab3dcb5596861fda68d8b1119d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "804345d843feb24cfda1e2c871026d19b93741ab3dcb5596861fda68d8b1119d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/openhands_rollout_prefix.patch",
+      "size_bytes": 2680,
+      "sha256": "fc890eae1a6d9d8a495049c2d85450d4e67c4ad6e121a6e12c221f6cb2b04bfb",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "fc890eae1a6d9d8a495049c2d85450d4e67c4ad6e121a6e12c221f6cb2b04bfb",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/openhands_setup_portability.patch",
+      "size_bytes": 1981,
+      "sha256": "6e87c20bc4ed687a253ea8d3e9aa37b46db6ac4498c3ad14ad987f92b6823123",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "6e87c20bc4ed687a253ea8d3e9aa37b46db6ac4498c3ad14ad987f92b6823123",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/r2egym_test_layout.patch",
+      "size_bytes": 2566,
+      "sha256": "d7d835b23ae57411861042d50c8817154194f7fc5f012728683fd318bacab734",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "d7d835b23ae57411861042d50c8817154194f7fc5f012728683fd318bacab734",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/r2egym_test_layout_setup.patch",
+      "size_bytes": 835,
+      "sha256": "babd9fc95760b72338d3bf9038755a156c1b09b598ad8855c72d8d94f8648f0a",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "babd9fc95760b72338d3bf9038755a156c1b09b598ad8855c72d8d94f8648f0a",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/swe_agents_r2e.patch",
+      "size_bytes": 13808,
+      "sha256": "4d1a43964e7c820263dc20636ad04f941ebd5372c97b0bc53b2a9c84a1a21d98",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "4d1a43964e7c820263dc20636ad04f941ebd5372c97b0bc53b2a9c84a1a21d98",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/patches/workplace_assistant_cleanup.patch",
+      "size_bytes": 5034,
+      "sha256": "0f0eff1af48b154b01e05b2437bb5238cfa3c26daa4e810d3dba73bdad21bb2c",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "0f0eff1af48b154b01e05b2437bb5238cfa3c26daa4e810d3dba73bdad21bb2c",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/python_startup/sitecustomize.py",
+      "size_bytes": 486,
+      "sha256": "bca2b7628580f574d08cecb2a51a7612dffc931067366bbfaf45dc7fcb6a6835",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "bca2b7628580f574d08cecb2a51a7612dffc931067366bbfaf45dc7fcb6a6835",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/registry.py",
+      "size_bytes": 20765,
+      "sha256": "553de248f815c0a1657b1c525a674ce8cbc3e0868013495fd34c0b381186afc6",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "553de248f815c0a1657b1c525a674ce8cbc3e0868013495fd34c0b381186afc6",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/run_adapter.py",
+      "size_bytes": 17117,
+      "sha256": "94f96f54d698e8f872f7c7fac117df7e5b0113606ee3e2cbe0db54368bed34a8",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "94f96f54d698e8f872f7c7fac117df7e5b0113606ee3e2cbe0db54368bed34a8",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "examples/nemo_gym_agentic/service/verbose_logging.py",
+      "size_bytes": 1413,
+      "sha256": "34aea8b7bc9abeb5bd1199e599992791d7f8e976934649f4274fe2386adc243d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "34aea8b7bc9abeb5bd1199e599992791d7f8e976934649f4274fe2386adc243d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "relax/agentic/runner/ipc.py",
+      "size_bytes": 33299,
+      "sha256": "325f52d448f68487b1ef2048c3123b09f85d609a3617e6f46c0c6f79ad594cbf",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "325f52d448f68487b1ef2048c3123b09f85d609a3617e6f46c0c6f79ad594cbf",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "relax/backends/megatron/actor.py",
+      "size_bytes": 179311,
+      "sha256": "e34d3cc2fc863a7ce63d32e04e984c0a18edea5122c4173d7d86c18f6ac8b588",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "e34d3cc2fc863a7ce63d32e04e984c0a18edea5122c4173d7d86c18f6ac8b588",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/backends/megatron/cp_utils.py",
+      "size_bytes": 36735,
+      "sha256": "6e15b60dfb467fa59415e812780313c76445c8dbb595f040ecb8cc204417069e",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "6e15b60dfb467fa59415e812780313c76445c8dbb595f040ecb8cc204417069e",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/backends/megatron/data.py",
+      "size_bytes": 79631,
+      "sha256": "1dfac6ca3aada5cdb1081970530210dc10e2318222234556603e2085fcc77c40",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "1dfac6ca3aada5cdb1081970530210dc10e2318222234556603e2085fcc77c40",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/backends/megatron/loss.py",
+      "size_bytes": 77681,
+      "sha256": "681d29b0dd9bf806930141059df1339460765b25f07c78f435210c0a8d0abec0",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "681d29b0dd9bf806930141059df1339460765b25f07c78f435210c0a8d0abec0",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/backends/megatron/model.py",
+      "size_bytes": 97803,
+      "sha256": "b2b6597ff652819c413e1617079cd1535b7a4f10a75417689ba44562a6a00c85",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "b2b6597ff652819c413e1617079cd1535b7a4f10a75417689ba44562a6a00c85",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/backends/megatron/prompt_loss.py",
+      "size_bytes": 6137,
+      "sha256": "6bfe26702156279ef7af8bbd9ed0514c6b9cc8a80d6f7c032f396be81565d9b5",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "6bfe26702156279ef7af8bbd9ed0514c6b9cc8a80d6f7c032f396be81565d9b5",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/components/rollout.py",
+      "size_bytes": 44714,
+      "sha256": "6b185ea887062e4ab20dad20aa646266fcb50083146d759f1f31565d18a0162f",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "6b185ea887062e4ab20dad20aa646266fcb50083146d759f1f31565d18a0162f",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "relax/utils/arguments.py",
+      "size_bytes": 217651,
+      "sha256": "32347eda84721fa147541ae438b07930b23ff267e4d11dfd5f746da63ef84f4e",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "32347eda84721fa147541ae438b07930b23ff267e4d11dfd5f746da63ef84f4e",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/utils/data/stream_dataloader.py",
+      "size_bytes": 77856,
+      "sha256": "229e061463f75fccb2c030bdbf925d25d3310c0f6341e5acdbb017f94e038f02",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "229e061463f75fccb2c030bdbf925d25d3310c0f6341e5acdbb017f94e038f02",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "relax/utils/utils.py",
+      "size_bytes": 29961,
+      "sha256": "814fa835a3ac07e6987a2a530ec6519b4fbf6ec517f1c61d4bbab5dd1a0bf4df",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "814fa835a3ac07e6987a2a530ec6519b4fbf6ec517f1c61d4bbab5dd1a0bf4df",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/create_gateway_token.py",
+      "size_bytes": 1140,
+      "sha256": "3bdc23c82bc75be72286f0af3f00fe822b71f36f0ace3673940a13415808493d",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "3bdc23c82bc75be72286f0af3f00fe822b71f36f0ace3673940a13415808493d",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/launch.sh",
+      "size_bytes": 2254,
+      "sha256": "8b0731edc0f1beb326f238a4224e821bf0d9fce76ad76b44e22910c214bb3893",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "8b0731edc0f1beb326f238a4224e821bf0d9fce76ad76b44e22910c214bb3893",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/prepare_environment.py",
+      "size_bytes": 1244,
+      "sha256": "67319fd068ad9e4bf64c086960709df40227fb636854f6cb939758bb840fac77",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "67319fd068ad9e4bf64c086960709df40227fb636854f6cb939758bb840fac77",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/start_node.sh",
+      "size_bytes": 4317,
+      "sha256": "9ccad27346e6d4fc3612d54c218d20403fff6cffc86565c439ba21ec6f5f246c",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "9ccad27346e6d4fc3612d54c218d20403fff6cffc86565c439ba21ec6f5f246c",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/verify_bundle.py",
+      "size_bytes": 6376,
+      "sha256": "2769a9a905d3566430338a67c18dd64e64ab977eef49580d5eae9b18a3820c52",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "2769a9a905d3566430338a67c18dd64e64ab977eef49580d5eae9b18a3820c52",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/verify_inputs.py",
+      "size_bytes": 3691,
+      "sha256": "4eaa8eb2b6f1723dd70ef8f07e2d1b062ddef6571d67a63c7312d9f46b62f478",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "4eaa8eb2b6f1723dd70ef8f07e2d1b062ddef6571d67a63c7312d9f46b62f478",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "scripts/entrypoint/ray-job.sh",
+      "size_bytes": 12099,
+      "sha256": "ed6a8bd12270a2cd59e929f0e5c62c55f9ef6eb6a7489b3b846058f08f56b321",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "ed6a8bd12270a2cd59e929f0e5c62c55f9ef6eb6a7489b3b846058f08f56b321",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "scripts/models/qwen36-35B-A3B.sh",
+      "size_bytes": 1256,
+      "sha256": "a311b48f0f1f4bbd14b5d538a835ff6e4a4090557d3ffa8bec8b7e8720a07225",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "a311b48f0f1f4bbd14b5d538a835ff6e4a4090557d3ffa8bec8b7e8720a07225",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/backends/megatron/test_prompt_equal_loss.py",
+      "size_bytes": 6476,
+      "sha256": "63e841713d4c13adf915c77bd0aeed6baecf8f8db69c44e7e46e7721fcfa3576",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": "63e841713d4c13adf915c77bd0aeed6baecf8f8db69c44e7e46e7721fcfa3576",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_compaction_contract.py",
+      "size_bytes": 5902,
+      "sha256": "369356115b0cdd022087a308db867f064fa44e2b80505ecc499e6fc5f1a82d77",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "369356115b0cdd022087a308db867f064fa44e2b80505ecc499e6fc5f1a82d77",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_context_capture.py",
+      "size_bytes": 4974,
+      "sha256": "a055d672fe8857959b358a2b063e0b499d5dd2a5c08adbbaedbf5cc992de0eed",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "a055d672fe8857959b358a2b063e0b499d5dd2a5c08adbbaedbf5cc992de0eed",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_gym_environment.py",
+      "size_bytes": 6189,
+      "sha256": "661569f62c46cae363792885032c3566d8d67de3e7279a89ebcb329d9715f83f",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "5d88504626887374906263f847b3fc2d300118c877eae131fc55da7f279d73ce",
+      "matches_release": false,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_harbor_entrypoint.py",
+      "size_bytes": 12224,
+      "sha256": "98c8d49e55cf2f3d29e1063c884c3f05dab156fd8f5a5624ab8e89d708bae20b",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": null,
+      "matches_release": null,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_local_relay.py",
+      "size_bytes": 15634,
+      "sha256": "e8a49cc691897dc863db431b91fecd40aa7d9589dda648b321d76639e9a06b39",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "e8a49cc691897dc863db431b91fecd40aa7d9589dda648b321d76639e9a06b39",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_oci_lifecycle.py",
+      "size_bytes": 11211,
+      "sha256": "66400e44f1bd01fef7f2561fc67b04b3332ed2ff0ca170e204aaac6182fc05ae",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "66400e44f1bd01fef7f2561fc67b04b3332ed2ff0ca170e204aaac6182fc05ae",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_oci_packages.py",
+      "size_bytes": 4271,
+      "sha256": "b7c149cbfadafa739dcef56ee92be40ac7c6558c5283cf578c805774d5056c50",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "b7c149cbfadafa739dcef56ee92be40ac7c6558c5283cf578c805774d5056c50",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_oci_paths.py",
+      "size_bytes": 1402,
+      "sha256": "9f06d998ee1af54b5019ac87e56be92a5a5809316612ccf118b6a571d59b4bd7",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": null,
+      "matches_release": null,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_portable_data.py",
+      "size_bytes": 8869,
+      "sha256": "9ddd957c23d19d87a38ef4213fc3e80809bd9855b4d2515d14576c73a7915081",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "9ddd957c23d19d87a38ef4213fc3e80809bd9855b4d2515d14576c73a7915081",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_qs_bootstrap.py",
+      "size_bytes": 5287,
+      "sha256": "703e0868fe388b2d007ed5414988442732c7742755b387ff3fe4572b65ec2739",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "7af3c6848f5b22f3c61fc45e166eb5a3a5e9728b8dda23ad45eab41f0a287954",
+      "matches_release": false,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_reproduction_inputs.py",
+      "size_bytes": 4457,
+      "sha256": "323dcbd0967c5bd0f2821728317c22b4c5cfe60656653c239caa1f64e2a2723e",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "323dcbd0967c5bd0f2821728317c22b4c5cfe60656653c239caa1f64e2a2723e",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_request_normalization.py",
+      "size_bytes": 3948,
+      "sha256": "7ed04cb83ae9b21d4881adc8630dc9096bb4ffebe72e05dd2bb383978ce4bcc7",
+      "tracked": true,
+      "working_tree_status": "clean",
+      "release_sha256": "7ed04cb83ae9b21d4881adc8630dc9096bb4ffebe72e05dd2bb383978ce4bcc7",
+      "matches_release": true,
+      "release_overlay": false
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_training_data.py",
+      "size_bytes": 10970,
+      "sha256": "69a9d36bc465bd1a98ef3eb818bfaba31fd0ce00e558f832609b4e7f4859de40",
+      "tracked": true,
+      "working_tree_status": "M",
+      "release_sha256": "69a9d36bc465bd1a98ef3eb818bfaba31fd0ce00e558f832609b4e7f4859de40",
+      "matches_release": true,
+      "release_overlay": true
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_verify_oci.py",
+      "size_bytes": 9395,
+      "sha256": "1568cd835946a8cbf42dd0b0fbf8df5004ffefd0e4c917c210c98097631faa8a",
+      "tracked": false,
+      "working_tree_status": "??",
+      "release_sha256": null,
+      "matches_release": null,
+      "release_overlay": false
+    }
+  ]
+}

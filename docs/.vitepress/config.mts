@@ -343,6 +343,7 @@ export default defineConfig({
               text: 'Examples',
               items: [
                 { text: 'DeepEyes', link: '/en/examples/deepeyes' },
+                { text: 'Claude Code / Harbor', link: '/en/examples/claude-code-harbor' },
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
                 { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
@@ -467,6 +468,7 @@ export default defineConfig({
               text: '示例',
               items: [
                 { text: 'DeepEyes', link: '/zh/examples/deepeyes' },
+                { text: 'Claude Code / Harbor 一键运行', link: '/zh/examples/claude-code-harbor' },
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
                 { text: '低精度训练', link: '/zh/examples/low-precision-training' },
