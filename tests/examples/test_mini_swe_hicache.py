@@ -23,7 +23,13 @@ def submission(tmp_path):
     repo = tmp_path / "repo"
     example = repo / "examples/mini_swe_agent"
     example.mkdir(parents=True)
-    for name in ("run_mini_swe_agent_pd.sh", "run_mini_swe_agent_hicache.sh"):
+    for name in (
+        "run_mini_swe_agent_pd.sh",
+        "run_mini_swe_agent_hicache.sh",
+        "hicache-cpu-4x-tp2.yaml",
+        "pd-hicache-cpu-2p2d-tp2.yaml",
+        "pd-hicache-cpu-1p1d-dp2-tp2-ep4.yaml",
+    ):
         shutil.copy2(EXAMPLE / name, example / name)
     models = repo / "scripts/models"
     models.mkdir(parents=True)
@@ -52,6 +58,7 @@ def submission(tmp_path):
         "SAVE_DIR": str(tmp_path / "save"),
         "EXP_ROOT": str(tmp_path / "exp"),
         "RUN_ID": "test-hicache",
+        "HICACHE_TIER": "cpu",
         "ROLLOUT_BATCH_SIZE": "1",
         "AGENT_SERVER_TRAIN_CONCURRENCY": "8",
         "ENABLE_EVAL": "0",
@@ -90,7 +97,7 @@ def test_hicache_submission_rejects_unknown_deployment(submission):
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0 and "regular or pd" in result.stderr
+    assert result.returncode != 0 and "regular, pd or pd-dp2" in result.stderr
     assert not Path(env["CAPTURE"]).exists()
 
 
@@ -123,3 +130,55 @@ def test_cpu_cache_examples_support_both_topologies(filename, roles, gpus, engin
             assert overrides["hicache_write_policy"] == "write_through"
             assert overrides["chunked_prefill_size"] // attention_dp == 8192
             assert overrides["max_mamba_cache_size"] // attention_dp == 666
+
+
+@pytest.mark.parametrize("deployment", ["regular", "pd", "pd-dp2"])
+def test_mooncake_submission_embeds_store_config_without_enabling_decode(submission, deployment, tmp_path):
+    example, env = submission
+    store = {"master_server_address": "store.invalid:50051", "protocol": "tcp", "global_segment_size": 0}
+    path = tmp_path / "store.json"
+    path.write_text(json.dumps(store))
+    result = subprocess.run(
+        ["bash", str(example / "run_mini_swe_agent_hicache.sh")],
+        env={
+            **env,
+            "HICACHE_TIER": "mooncake",
+            "HICACHE_DEPLOYMENT": deployment,
+            "HICACHE_MOONCAKE_CONFIG": str(path),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    args = json.loads(Path(env["CAPTURE"]).read_text())
+    selected = [args[i + 1] for i, value in enumerate(args) if value == "--sglang-config"][-1]
+    config = yaml.safe_load(Path(selected).read_text())["sglang"][0]
+    assert config["num_gpus_per_engine"] == (4 if deployment == "pd-dp2" else 2)
+    for group in config["engine_groups"]:
+        overrides = group["overrides"]
+        if group["worker_type"] == "decode":
+            assert not overrides["enable_hierarchical_cache"]
+            assert overrides["hicache_storage_backend"] is None
+        else:
+            assert overrides["enable_hierarchical_cache"]
+            assert overrides["hicache_storage_backend"] == "mooncake"
+            assert json.loads(overrides["hicache_storage_backend_extra_config"]) == store
+            assert overrides["hicache_storage_prefetch_policy"] == "wait_complete"
+    if deployment == "pd-dp2":
+        assert "--sglang-enable-dp-attention" in args
+        assert args[args.index("--sglang-dp-size") + 1] == "2"
+        assert args[args.index("--sglang-ep-size") + 1] == "4"
+
+
+def test_mooncake_submission_rejects_missing_master(submission, tmp_path):
+    example, env = submission
+    path = tmp_path / "store.json"
+    path.write_text("{}")
+    result = subprocess.run(
+        ["bash", str(example / "run_mini_swe_agent_hicache.sh")],
+        env={**env, "HICACHE_TIER": "mooncake", "HICACHE_MOONCAKE_CONFIG": str(path)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0 and "master_server_address" in result.stderr
+    assert not Path(env["CAPTURE"]).exists()

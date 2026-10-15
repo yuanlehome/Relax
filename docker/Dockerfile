@@ -167,6 +167,13 @@ COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-p
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
     patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
 
+# Pin the Store SDK used by the native Unified KV + Mamba L3 backend.
+ARG MOONCAKE_VERSION=0.3.12.post1
+RUN python -m pip install --no-cache-dir --no-deps "mooncake-transfer-engine==${MOONCAKE_VERSION}" && \
+    python -c "from mooncake.store import MooncakeDistributedStore; import shutil; \
+        assert hasattr(MooncakeDistributedStore, 'batch_get_into'); \
+        assert shutil.which('mooncake_master') and shutil.which('mooncake_client')"
+
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
