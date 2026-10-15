@@ -152,6 +152,11 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     for sample_index, loss_mask in zip(sample_indices, loss_masks, strict=True):
         mask_sums_by_sample_index[sample_index] = mask_sums_by_sample_index.get(sample_index, 0) + int(sum(loss_mask))
     train_data["sample_index_mask_sums"] = [mask_sums_by_sample_index[sample_index] for sample_index in sample_indices]
+    if getattr(args, "prompt_equal_loss", False):
+        prompt_ids = [sample.metadata.get("_loss_prompt_index") for sample in samples]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in prompt_ids):
+            raise ValueError("Prompt-equal loss requires a stable numeric prompt identity on every context")
+        train_data["loss_prompt_ids"] = prompt_ids
 
     # For rollout buffer
     if samples[0].metadata and "round_number" in samples[0].metadata:

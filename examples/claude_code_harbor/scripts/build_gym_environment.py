@@ -101,7 +101,16 @@ def smoke(prefix: Path, repo: Path, env: dict[str, str], log: Path) -> None:
     )
 
 
-def prepare(prefix: Path, repo: Path, source_url: str = NEMO_REPOSITORY, *, check: bool = False) -> dict[str, str]:
+def prepare(
+    prefix: Path,
+    repo: Path,
+    source_url: str = NEMO_REPOSITORY,
+    *,
+    check: bool = False,
+    check_log: Path | None = None,
+) -> dict[str, str]:
+    if check_log is not None and not check:
+        raise ValueError("--check-log requires --check")
     if platform.system() != "Linux" or sys.version_info[:2] != (3, 12):
         raise RuntimeError("Use the Relax Linux training image with CPython 3.12")
     if sys.prefix != sys.base_prefix:
@@ -113,6 +122,7 @@ def prepare(prefix: Path, repo: Path, source_url: str = NEMO_REPOSITORY, *, chec
     signature = hashlib.sha256(overlay.read_bytes() + base.read_bytes()).hexdigest()
     env = clean_environment()
     if check:
+        env.update(PYTHONDONTWRITEBYTECODE="1", GIT_OPTIONAL_LOCKS="0")
         manifest = json.loads((prefix / "build.json").read_text())
         if manifest["nemo_commit"] != NEMO_COMMIT or manifest["requirements_sha256"] != signature:
             raise RuntimeError("The built environment does not match this recipe; choose a fresh --prefix")
@@ -120,7 +130,7 @@ def prepare(prefix: Path, repo: Path, source_url: str = NEMO_REPOSITORY, *, chec
         # Reserve the final path atomically. Venv shebangs contain this path, so
         # never build elsewhere and move it, nor overwrite a live environment.
         prefix.mkdir(parents=True, mode=0o700, exist_ok=False)
-    log = prefix / "build.log"
+    log = check_log if check_log is not None else prefix / "build.log"
     log.touch(mode=0o600, exist_ok=True)
     python = Path(sys.executable)
     before = packages(python, env=env, log=log)
@@ -211,10 +221,15 @@ def main() -> None:
     parser.add_argument("--repo", type=Path, default=REPO_ROOT)
     parser.add_argument("--source-url", default=NEMO_REPOSITORY, help="Git mirror; the required commit stays fixed")
     parser.add_argument("--check", action="store_true", help="Validate an existing build without installing packages")
+    parser.add_argument("--check-log", type=Path, help="Write check output outside a reused runtime")
     args = parser.parse_args()
     cloud = Path(os.environ.get("CLOUD_ROOT", "."))
     result = prepare(
-        (cloud / args.prefix).absolute(), (cloud / args.repo).resolve(), args.source_url, check=args.check
+        (cloud / args.prefix).absolute(),
+        (cloud / args.repo).resolve(),
+        args.source_url,
+        check=args.check,
+        check_log=(cloud / args.check_log).absolute() if args.check_log is not None else None,
     )
     sys.stdout.write(json.dumps(result) + "\n")
 

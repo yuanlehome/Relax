@@ -239,7 +239,7 @@ def get_sum_of_sample_mean(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
-    sample_denoms: list[int] | None = None,
+    sample_denoms: list[float] | list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
     if not calculate_per_token_loss:

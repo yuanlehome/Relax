@@ -1018,7 +1018,13 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+            if (
+                "lengths" in k
+                or "reward" in k
+                or k == "sample_index_mask_sums"
+                or getattr(args, "prompt_equal_loss", False)
+                and k in {"sample_indices", "loss_prompt_ids"}
+            ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path

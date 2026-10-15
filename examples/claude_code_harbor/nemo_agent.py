@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import secrets
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +38,7 @@ class TaskContext:
     sandbox: DockerSandbox
     relay: LocalModelRelay
     api_key: str
+    backend_timed_out: bool = False
 
 
 _TASK: ContextVar[TaskContext] = ContextVar("harbor_cc_task")
@@ -156,6 +159,17 @@ class HarborClaudeCodeAgent(ClaudeCodeAgent):
         for alias in ("SONNET", "OPUS", "HAIKU"):
             env[f"ANTHROPIC_DEFAULT_{alias}_MODEL"] = model
         env.pop("DISABLE_COMPACT", None)
+        timeout = metadata.get("harbor_backend_timeout_s")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("Harbor backend timeout must be a finite positive number")
+        # Match the frozen business backend-call boundary: sandbox setup and
+        # verifier time are outside this wall-clock budget.
+        deadline = None if timeout is None else time.monotonic() + timeout
         task = asyncio.create_task(
             context.sandbox.request(
                 "agent",
@@ -168,10 +182,20 @@ class HarborClaudeCodeAgent(ClaudeCodeAgent):
         )
         try:
             while not task.done():
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Fence before killing the CLI. An accepted model call must
+                    # survive its client's disconnect and commit canonically.
+                    context.relay.begin_harvest()
+                    context.backend_timed_out = True
+                    context.sandbox.stop_agent()
+                    break
                 if context.relay.terminal_reason is not None:
                     context.sandbox.stop_agent()
                 await asyncio.sleep(0.2)
             result = await task
+            if context.backend_timed_out:
+                await context.relay.finish_harvest()
+                return "", model
         finally:
             if not task.done():
                 task.cancel()
@@ -209,19 +233,25 @@ class HarborClaudeCodeAgent(ClaudeCodeAgent):
         try:
             api_key = secrets.token_urlsafe(32)
             relay = LocalModelRelay(self._resolve_call_base_url(rollout_id), api_key, normalization_id=rollout_id)
-            token = _TASK.set(TaskContext(sandbox, relay, api_key))
+            context = TaskContext(sandbox, relay, api_key)
+            token = _TASK.set(context)
             relay.start()
             await sandbox.start()
             response = await self._create_response(body.responses_create_params, rollout_id=rollout_id)
             relay.close()
-            verification = await sandbox.verify()
-            reward = verification["reward"]
+            if context.backend_timed_out:
+                reward = 0.0
+            else:
+                verification = await sandbox.verify()
+                reward = verification["reward"]
             records = relay.capture.export(
                 reward,
                 {
                     "instance_id": metadata["instance_id"],
                     "dataset": metadata["dataset"],
-                    "termination_reason": relay.terminal_reason or "completed",
+                    "termination_reason": "backend_timeout"
+                    if context.backend_timed_out
+                    else relay.terminal_reason or "completed",
                 },
             )
             logger.info("NeMo Harbor CC task=%s contexts=%s reward=%s", metadata["instance_id"], len(records), reward)
@@ -230,6 +260,7 @@ class HarborClaudeCodeAgent(ClaudeCodeAgent):
                     **body.model_dump(),
                     "response": response.model_dump(mode="json"),
                     "reward": reward,
+                    "truncated": context.backend_timed_out,
                     "metadata": {"contexts": records},
                 }
             )

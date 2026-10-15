@@ -110,6 +110,47 @@ def image_mapping(rows: list[dict], supplied: Path | None) -> dict[str, str]:
     return mapping
 
 
+def discover_wheels(
+    source: Path,
+    assets_manifest: Path | None = None,
+    *,
+    keys: tuple[str, ...] = ("BBS_WHEEL_PATH", "DRESSAGE_WHEEL_PATH"),
+) -> dict[str, str]:
+    """Resolve checksum-pinned original wheels from the source project's
+    layout.
+
+    The dataset uses src_env placeholders for these two uploads. The companion
+    manifest records their original locations and hashes; no prior prepared run
+    is needed at launch time.
+    """
+    source = source.resolve()
+    lock = json.loads((assets_manifest or Path(__file__).with_name("source-assets.json")).read_text())
+    relative = Path(lock["dataset_project_path"])
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError("Invalid source asset manifest dataset path")
+    digest = sha256(source / "data.jsonl")
+    if digest != lock["dataset_sha256"] or digest != json.loads((source / "manifest.json").read_text()).get(
+        "data_sha256"
+    ):
+        raise ValueError("Dataset differs from the pinned source assets; set explicit wheel paths for another dataset")
+    if source.parts[-len(relative.parts) :] != relative.parts:
+        raise ValueError("Source project layout changed; set BBS_WHEEL_PATH and DRESSAGE_WHEEL_PATH")
+    project = source.parents[len(relative.parts) - 1]
+    result = {}
+    for key in keys:
+        record = lock["wheels"][key]
+        relative_wheel = Path(record["project_path"])
+        path = project / relative_wheel
+        if relative_wheel.is_absolute() or ".." in relative_wheel.parts or not path.resolve().is_relative_to(project):
+            raise ValueError("Source wheel path escapes its project")
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("Original source wheel is missing; mount the dataset's referenced runtime assets")
+        if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
+            raise ValueError("Original source wheel differs from its pinned size or checksum")
+        result[key] = str(path)
+    return result
+
+
 def prepare(arguments: argparse.Namespace) -> dict[str, int | str]:
     cloud = arguments.cloud_root.resolve() if arguments.cloud_root else None
     source = cloud_path(arguments.source_root, cloud).resolve()

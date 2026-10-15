@@ -113,6 +113,21 @@ def test_shared_response_hashes_are_scoped_to_each_logical_session() -> None:
     assert sum(sum(mask) for mask in result["loss_masks"]) == 16
 
 
+def test_budget_harvest_preserves_real_tokens_and_marks_all_contexts_truncated() -> None:
+    samples = branched_samples()
+    for sample in samples:
+        sample.metadata.update(termination_reason="backend_timeout", outcome_reward=0.0, _loss_prompt_index=7)
+    original = copy.deepcopy(samples)
+    config = args()
+    config.prompt_equal_loss = True
+    result = convert_samples_to_train_data(config, samples)
+    assert result["truncated"] == [1, 1, 1]
+    assert result["loss_prompt_ids"] == [7, 7, 7]
+    assert result["tokens"] == [sample.tokens for sample in original]
+    assert result["sample_index_mask_sums"] == [8, 8, 8]
+    assert samples == original
+
+
 def test_shared_response_plan_preserves_logical_grpo_normalization() -> None:
     samples = branched_samples()
     exports = {sample.metadata[RESPONSE_MASK_KEY]["context_name"]: sample.metadata for sample in samples}

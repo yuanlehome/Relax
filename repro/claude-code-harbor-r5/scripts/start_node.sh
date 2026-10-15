@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Run on each OCI-capable node of a NEW, idle reproduction cluster.
 set -euo pipefail
+umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_DIR="${BUNDLE_DIR:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 RELAX_ROOT="${REPO:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
@@ -14,8 +15,10 @@ NODE_STATE="${BUNDLE_DIR}/service_state/${NODE_IP}"
 GYM_RUNTIME_DIR="${GYM_RUNTIME_DIR:-${BUNDLE_DIR}/runtime/gym}"
 source "${SCRIPT_DIR}/../../../examples/claude_code_harbor/scripts/cloud_paths.sh"
 harbor_resolve_paths RELAX_ROOT BUNDLE_DIR DATA_ROOT OCI_ROOT NODE_STATE GYM_RUNTIME_DIR
+python3 "${RELAX_ROOT}/examples/claude_code_harbor/scripts/oci_paths.py" "${OCI_ROOT}"
 export NEMO_GYM_ROOT="${GYM_RUNTIME_DIR}/nemo-gym"
 export NEMO_GYM_PYTHON="${GYM_RUNTIME_DIR}/nemo-venv/bin/python"
+export PYTHONDONTWRITEBYTECODE=1
 export NEMO_GYM_COMMIT="a85670eb167ba9b48cc53a36a070eed815e6c40d"
 export NEMO_GYM_TOKEN_FILE="${BUNDLE_DIR}/private/gateway.token"
 export NEMO_GYM_CALLBACK_ALLOWED_HOSTS
@@ -31,8 +34,10 @@ export CLAUDE_CODE_MAX_CACHED_IMAGES=4
 export PATH="${BUNDLE_DIR}/runtime/oci-runtime/fuse/usr/bin:${BUNDLE_DIR}/runtime/oci-runtime/docker:${PATH}"
 export LD_LIBRARY_PATH="${BUNDLE_DIR}/runtime/oci-runtime/fuse/usr/lib/x86_64-linux-gnu:${BUNDLE_DIR}/runtime/oci-runtime/fuse/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 test -s "${NEMO_GYM_TOKEN_FILE}"
+mkdir -p "${NODE_STATE}"
+chmod 700 "${NODE_STATE}"
 python3 "${RELAX_ROOT}/examples/claude_code_harbor/scripts/build_gym_environment.py" \
-  --prefix "${GYM_RUNTIME_DIR}" --repo "${RELAX_ROOT}" --check
+  --prefix "${GYM_RUNTIME_DIR}" --repo "${RELAX_ROOT}" --check --check-log "${NODE_STATE}/gym-check.log"
 test -s "${CLAUDE_CODE_IMAGE_MAP}"
 unshare -Ur true || { echo 'User namespace unavailable: use the fixed forwarder commands in README.' >&2; exit 2; }
 # Refuse to take over live ports or an existing Docker root. No stop/kill actions.

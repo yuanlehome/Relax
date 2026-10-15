@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -15,7 +16,7 @@ import pytest
 pytest.importorskip("responses_api_agents.claude_code_agent.app")
 
 from examples.claude_code_harbor.gym_service import create_service
-from examples.claude_code_harbor.nemo_agent import ClaudeCodeAgentRunRequest
+from examples.claude_code_harbor.nemo_agent import _TASK, ClaudeCodeAgentRunRequest, HarborClaudeCodeAgent, TaskContext
 
 
 @pytest.fixture(autouse=True)
@@ -154,3 +155,140 @@ async def test_failed_owned_container_removal_can_retry(monkeypatch: pytest.Monk
     assert (await agent.probe_cleanup("retry-0"))["clean"] is False
     assert (await agent.cleanup_rollout("retry-0"))["clean"] is True
     assert sandbox.attempts == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget,returncode", [(0.01, -15), (None, 0), (None, 1)])
+async def test_backend_budget_harvests_zero_but_does_not_mask_agent_failure(
+    monkeypatch: pytest.MonkeyPatch, budget: float | None, returncode: int
+) -> None:
+    events: list[str] = []
+    stopped = asyncio.Event()
+
+    class Sandbox:
+        metadata = {
+            "backend_options": {"model_name": "test", "workdir": "/tmp", "agent_kwargs": {"disallowed_tools": []}},
+            "sandbox_extra_params": {},
+            "harbor_backend_timeout_s": budget,
+        }
+
+        async def request(self, *args: Any, **kwargs: Any) -> dict[str, int]:
+            events.append("agent_started")
+            if budget is not None:
+                await stopped.wait()
+            return {"returncode": returncode}
+
+        def stop_agent(self) -> None:
+            events.append("stop_agent")
+            stopped.set()
+
+        def read_log(self, path: str) -> str:
+            return "synthetic output"
+
+    class Relay:
+        base_url = "http://127.0.0.1"
+        terminal_reason = None
+
+        def begin_harvest(self) -> None:
+            events.append("fence")
+
+        async def finish_harvest(self) -> None:
+            events.append("drained")
+
+    context = TaskContext(Sandbox(), Relay(), "synthetic")
+    token = _TASK.set(context)
+    try:
+        call = HarborClaudeCodeAgent._run_claude_code(None, "synthetic task")
+        if budget is None and returncode:
+            with pytest.raises(RuntimeError, match="no training reward"):
+                await call
+        else:
+            output, model = await asyncio.wait_for(call, 3)
+            assert model == "test"
+            assert output == ("" if budget else "synthetic output")
+        assert context.backend_timed_out is (budget is not None)
+        assert events == (["agent_started", "fence", "stop_agent", "drained"] if budget else ["agent_started"])
+    finally:
+        _TASK.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_backend_timeout_skips_verifier_and_exports_canonical_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.claude_code_harbor import nemo_agent
+
+    events: list[str] = []
+
+    class Sandbox:
+        def __init__(self, metadata: dict[str, Any]) -> None:
+            self.metadata = metadata
+
+        async def start(self) -> None:
+            events.append("start")
+
+        async def verify(self) -> dict[str, float]:
+            raise AssertionError("Budget timeout must skip verifier")
+
+    class Capture:
+        def export(self, reward: float, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+            assert reward == 0 and metadata["termination_reason"] == "backend_timeout"
+            return [{"metadata": {**metadata, "outcome_reward": reward}}]
+
+    class Relay:
+        terminal_reason = None
+        capture = Capture()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("relay_closed")
+
+    class Agent:
+        _sandboxes: dict[str, Any] = {}
+
+        def _resolve_call_base_url(self, rollout_id: str) -> str:
+            return "http://127.0.0.1"
+
+        async def _create_response(self, *args: Any, **kwargs: Any) -> Any:
+            _TASK.get().backend_timed_out = True
+            return SimpleNamespace(model_dump=lambda **kwargs: {})
+
+        async def _ensure_cleanup(self, rollout_id: str) -> None:
+            events.append("cleanup")
+
+    monkeypatch.setattr(nemo_agent, "DockerSandbox", Sandbox)
+    monkeypatch.setattr(nemo_agent, "LocalModelRelay", Relay)
+    # Inspect the exact final payload independently of OpenAI response schema.
+    monkeypatch.setattr(
+        nemo_agent, "ClaudeCodeAgentVerifyResponse", SimpleNamespace(model_validate=lambda value: value)
+    )
+    body = ClaudeCodeAgentRunRequest.model_validate(
+        {
+            "responses_create_params": {"input": "synthetic task"},
+            "reward_fn": "harbor_verifier",
+            "blackbox_type": "harbor_agent",
+            "instance_id": "synthetic",
+            "dataset": "synthetic",
+        }
+    )
+    result = await HarborClaudeCodeAgent._run_task(Agent(), body, "synthetic")
+    assert result["reward"] == 0 and result["truncated"] is True
+    assert result["metadata"]["contexts"][0]["metadata"]["termination_reason"] == "backend_timeout"
+    assert events[-1] == "cleanup"
+
+
+@pytest.mark.asyncio
+async def test_pinned_nemo_accepts_empty_timeout_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def empty_output(self: Any, *args: Any, **kwargs: Any) -> tuple[str, str]:
+        return "", "synthetic"
+
+    monkeypatch.setattr(HarborClaudeCodeAgent, "_run_claude_code", empty_output)
+    agent = _agent(monkeypatch)
+    body = ClaudeCodeAgentRunRequest.model_validate({"responses_create_params": {"input": "synthetic task"}})
+    response = await agent._create_response(body.responses_create_params, rollout_id="synthetic")
+    # This empty control-plane envelope is never used as a training context.
+    assert response.output[0].content[0].text == ""
+    assert response.usage.input_tokens == 0 and response.usage.output_tokens == 0

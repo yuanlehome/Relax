@@ -1,5 +1,7 @@
 # Harbor 代码与运行交接：2026-10-14
 
+后续运行及实现发布见 [2026-10-15 交接](harbor-handoff-20261015.md)；本文保留原时点事实。
+
 这是一次运行交接快照，不是训练成功报告。为符合仓库敏感信息检查，下文部署路径使用配置占位符，内部平台以 Job/Trial/task ID 定位；完整挂载位置保存在本机私有交接副本。`${LOCAL_REPO}` 为本机 checkout，`${SHARED_REPO}` 为共享盘 checkout，`${SOURCE_PROJECT}` 为原始数据项目，`${MODEL_PARENT}` 为模型父目录，`${CONTROL_ROOT}` 为本地监控证据根。操作与配置说明见 [中文指南](../docs/zh/examples/claude-code-harbor.md) / [English guide](../docs/en/examples/claude-code-harbor.md)。文件版本见 [代码清单](harbor-code-inventory-20261014.json)。后续新 attempt 应追加记录，不能覆盖历史身份。
 
 ## 代码在哪里

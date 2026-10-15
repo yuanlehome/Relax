@@ -71,6 +71,17 @@ def test_explicit_output_accepts_context_jsonl(tmp_path: Path) -> None:
     assert read_explicit_records(path) == records
 
 
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_explicit_output_preserves_unicode_separators_inside_contexts(tmp_path: Path, separator: str) -> None:
+    path = tmp_path / "output.jsonl"
+    records = [_record("before", 0.5), _record("after", 0.5)]
+    for record in records:
+        record["messages"][1]["content"] = f"first{separator}second"
+    path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records), encoding="utf-8")
+
+    assert read_explicit_records(path) == records
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import http.client
 import json
@@ -319,4 +320,93 @@ def test_local_relay_client_disconnect_cancels_held_upstream(upstream: dict[str,
             relay.capture.export(0)
     finally:
         client.close()
+        relay.close()
+
+
+@pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.asyncio
+async def test_budget_harvest_retains_accepted_call_after_cli_disconnect(
+    upstream: dict[str, Any], status: int
+) -> None:
+    upstream["release"] = threading.Event()
+    upstream["status"] = status
+    relay = LocalModelRelay(upstream["base_url"], "session")
+    relay.start()
+    parsed = urlsplit(relay.base_url)
+    client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+    payload = {
+        "model": "proxy-model",
+        "max_tokens": 8192,
+        "stream": True,
+        "messages": [{"role": "user", "content": "synthetic task"}],
+    }
+    body = json.dumps(payload).encode()
+    try:
+        client.sendall(
+            b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nx-api-key: session\r\n"
+            b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        assert upstream["started"].wait(timeout=3)
+        client.recv(4096)
+        relay.begin_harvest()
+        client.shutdown(socket.SHUT_RDWR)
+        client.close()
+        harvest = asyncio.create_task(relay.finish_harvest())
+        await asyncio.sleep(0.2)
+        assert not harvest.done()
+        with pytest.raises(RuntimeError, match="closed"):
+            relay._submit(payload)
+        upstream["release"].set()
+        if status == 200:
+            await asyncio.wait_for(harvest, 3)
+            records = relay.capture.export(0, {"termination_reason": "backend_timeout"})
+            assert records[0]["metadata"]["outcome_reward"] == 0
+            assert records[0]["messages"][-1]["content"] == "answer"
+        else:
+            with pytest.raises(RuntimeError, match="failed during timeout harvest"):
+                await asyncio.wait_for(harvest, 3)
+            with pytest.raises(ValueError, match="without a captured"):
+                relay.capture.export(0)
+    finally:
+        upstream["release"].set()
+        client.close()
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_harvest_can_cancel_while_accepted_connect_is_blocked(
+    upstream: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    connect = http.client.HTTPConnection.connect
+    upstream_port = urlsplit(upstream["base_url"]).port
+
+    def blocked_connect(connection: http.client.HTTPConnection) -> None:
+        if connection.port == upstream_port:
+            entered.set()
+            release.wait(timeout=5)
+        connect(connection)
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", blocked_connect)
+    relay = LocalModelRelay(upstream["base_url"], "session")
+    relay.start()
+    try:
+        relay._submit(
+            {"model": "proxy-model", "max_tokens": 8192, "messages": [{"role": "user", "content": "synthetic"}]}
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        relay.begin_harvest()
+        harvest = asyncio.create_task(relay.finish_harvest())
+        await asyncio.sleep(0)
+        harvest.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(harvest, 1)
+        started = time.monotonic()
+        relay.close()
+        assert time.monotonic() - started < 2
+        assert upstream["calls"] == []
+        with pytest.raises(ValueError, match="without a captured"):
+            relay.capture.export(0)
+    finally:
+        release.set()
         relay.close()

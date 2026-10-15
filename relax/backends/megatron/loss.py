@@ -1105,7 +1105,7 @@ def policy_loss_function(
             total_lengths,
             response_lengths,
             modified_response_masks,
-            args.calculate_per_token_loss,
+            args.calculate_per_token_loss and not getattr(args, "prompt_equal_loss", False),
             args.qkv_format,
             max_seq_lens,
             padded_total_lengths,
@@ -1113,6 +1113,10 @@ def policy_loss_function(
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
             sample_denoms=batch.get("sample_index_mask_sums", None),
         )
+        if getattr(args, "prompt_equal_loss", False):
+            from relax.backends.megatron.prompt_loss import scale_prompt_reducer
+
+            sum_of_sample_mean = scale_prompt_reducer(sum_of_sample_mean, batch)
         if is_token_global:
             sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
                 sum_of_sample_mean, modified_response_masks
@@ -1685,7 +1689,7 @@ def loss_function(
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
-        args.calculate_per_token_loss,
+        args.calculate_per_token_loss and not getattr(args, "prompt_equal_loss", False),
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
@@ -1693,6 +1697,10 @@ def loss_function(
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         sample_denoms=batch.get("sample_index_mask_sums", None),
     )
+    if getattr(args, "prompt_equal_loss", False):
+        from relax.backends.megatron.prompt_loss import scale_prompt_reducer
+
+        sum_of_sample_mean = scale_prompt_reducer(sum_of_sample_mean, batch)
 
     if getattr(args, "mtp_only_training", False):
         func = mtp_only_loss_function

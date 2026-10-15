@@ -1930,6 +1930,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
+            parser.add_argument(
+                "--prompt-equal-loss",
+                action="store_true",
+                help="Use source prompt loss denominator max(prompt_tokens * prompt_count / GBS, 1) in Agentic GRPO.",
+            )
             reset_arg(parser, "--lr", type=float, default=1e-6)
 
             parser.add_argument("--num-critic-only-steps", type=int, default=0, help="Number of critic only steps")
@@ -3672,6 +3677,10 @@ def validate_algorithm_args(args) -> None:
     function owns the frozen Task 29 wording for the REINFORCE++ variants, and
     checking the same conditions here first would replace its messages.
     """
+    if getattr(args, "prompt_equal_loss", False):
+        from relax.backends.megatron.prompt_loss import validate_prompt_equal_loss
+
+        validate_prompt_equal_loss(args)
     spec = get_algorithm(args.advantage_estimator)
 
     # The spec references its implementations by name, so a typo in the registry

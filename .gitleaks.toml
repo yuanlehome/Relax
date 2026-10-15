@@ -19,6 +19,13 @@ id = "internal-path-mnt"
 description = "Detects references to internal mount path /mnt/"
 regex = '''(?i)/mnt/[^\s'"]+'''
 tags = ["internal", "path"]
+  [rules.allowlist]
+  # The user requested exact shared-storage paths in this run handoff.
+  # Only mount-path findings are allowed; secret and endpoint rules still apply.
+  paths = [
+    '''(?:^|/)reports/harbor-handoff-20261015\.md$''',
+    '''(?:^|/)reports/harbor-code-inventory-20261015\.json$''',
+  ]
 
 # Custom rule: Platform injected environment variables - QS_ prefix
 [[rules]]

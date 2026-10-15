@@ -26,7 +26,8 @@ def read_explicit_records(path: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        # JSONL uses LF separators; Unicode line separators can occur inside JSON strings.
+        records = [json.loads(line) for line in text.split("\n") if line.strip()]
     else:
         expanded = explicit_context_records(payload) if isinstance(payload, dict) else None
         records = expanded if expanded is not None else [payload]

@@ -1359,6 +1359,7 @@ def log_rollout_data(
                 "loss_masks",
                 "sample_indices",
                 "sample_index_mask_sums",
+                "prompt_loss_total_tokens",
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",

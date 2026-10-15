@@ -1,0 +1,17 @@
+{
+  "dataset_cloud_path": "pevek01/youhj/codes/swe/data/rl_dataset/20261009-150037-mimo-v26-code-claude_code-srt-gitclean-w200k",
+  "dataset_project_path": "data/rl_dataset/20261009-150037-mimo-v26-code-claude_code-srt-gitclean-w200k",
+  "dataset_sha256": "6285be128a1d0a1d77a203b1a262a5a12ca5e6bc3f7ff62b8e910b36ba12cfda",
+  "wheels": {
+    "BBS_WHEEL_PATH": {
+      "project_path": "logs/rl/2610/261009-140915-claude_code_mimo-v26code-a64-bs32-sortedev-1409_28n4e/20261009-1409-claude_code_mimo-v26code-a64-bs32-sortedev-1409_24n4e/wheels/dressage_blackbox_server-1.0.0-py3-none-any.whl",
+      "bytes": 111736,
+      "sha256": "3dd88f04b3c2b576d7264ec6b55949b4944e989bc2f529bdc5de7efa78420506"
+    },
+    "DRESSAGE_WHEEL_PATH": {
+      "project_path": "logs/rl/2610/261009-140915-claude_code_mimo-v26code-a64-bs32-sortedev-1409_28n4e/20261009-1409-claude_code_mimo-v26code-a64-bs32-sortedev-1409_24n4e/wheels/dressage-0.1.0-py3-none-any.whl",
+      "bytes": 622388,
+      "sha256": "a20192b1724db27fb3053ed0d75022df27aaa55bd82562fcbcb3edb40f9dedeb"
+    }
+  }
+}

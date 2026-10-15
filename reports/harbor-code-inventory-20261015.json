@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "handoff": "harbor-handoff-20261015.md",
+  "branch": "codex/claude-code-agentic-128xh800",
+  "git_base": "1ec9ba96d5ffce14c98daa82f51df6be6e39ba48",
+  "deployed_base": "b582cfc811ed6dc9b7bb085cc3e07488993eb800",
+  "deployed_release": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/releases/b582cfc811ed-alignfix-2220455-dump2-v3-20261015",
+  "deployed_manifest_sha256": "8162be534c2c886d70206359329b371bc9115fd558ce0a1e4352cd396922ba5e",
+  "deployed_release_modified_by_publication": false,
+  "preserved_head_files": [
+    "docs/.vitepress/config.mts",
+    "docs/en/examples/claude-code-harbor.md",
+    "docs/zh/examples/claude-code-harbor.md"
+  ],
+  "validation": {
+    "evidence_directory": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/runs/harbor-dump2-2220455-v3/handoff/publication-validation",
+    "pre_commit_command": "pre-commit run --all-files --show-diff-on-failure",
+    "pre_commit_log": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/runs/harbor-dump2-2220455-v3/handoff/publication-validation/precommit-final.log",
+    "syntax": {
+      "python_ast_files": 27,
+      "bash_n_files": 5,
+      "passed": true
+    },
+    "dump_and_persistence": {
+      "command": "python -m pytest -q tests/utils/training/test_raw_agentic_dump.py tests/examples/claude_code_harbor/test_persistent_run_agent.py",
+      "passed": 18,
+      "failed": 0,
+      "warnings": [
+        "Local pytest lacks pytest-asyncio; these synchronous tests passed with an unknown asyncio_mode configuration warning."
+      ],
+      "log": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/runs/harbor-dump2-2220455-v3/handoff/publication-validation/raw-and-persistence-tests.log"
+    },
+    "prompt_cp": {
+      "tests_passed": 14,
+      "subtests_passed": 36,
+      "failed": 0,
+      "skipped": 0,
+      "method": "CPU harness loads unmodified real CP/prompt functions and tests, bypasses incompatible Megatron package initialization, stubs MPU and unused process-group types, forbids CUDA and distributed initialization.",
+      "evidence": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/runs/harbor-dump2-2220455-v3/handoff/publication-validation/algorithm/"
+    },
+    "harbor_suite": {
+      "passed": 118,
+      "failed": 2,
+      "skipped": 0,
+      "method": "Existing pinned Gym venv with NEMO_GYM_EXTRA_ROOTS pointing to the publication worktree; temporary asyncio.run pytest hook executes coroutine tests without installing pytest-asyncio.",
+      "environment_failures": [
+        {
+          "test": "test_management_routes_require_token_but_readiness_and_callback_keep_their_contract",
+          "reason": "AnyIO imports typing_extensions.sentinel, absent in local installed typing_extensions; failed before business assertions."
+        },
+        {
+          "test": "test_shared_response_masks_reach_real_tis_and_cp_loss_reducers",
+          "reason": "Local Megatron multi_token_prediction lacks process_mtp_loss required by an unchanged Relax patch."
+        }
+      ],
+      "evidence": "/mnt/tidalfs-bdsz01/dataset/yuzhe1/xiaoliang/Relax/repro/runs/harbor-dump2-2220455-v3/handoff/publication-validation/agentic/"
+    },
+    "review": {
+      "remaining_confirmed_p0_p1": 0,
+      "generic_dump_compatibility_issue_fixed": true
+    },
+    "not_run": [
+      "No new multi-node GPU integration run: publication only; the existing frozen v3 job was not modified or restarted.",
+      "No real-model kernel/collective or hybrid/DeltaNet numerical-equivalence validation; reward improvement remains unproven."
+    ]
+  },
+  "files": [
+    {
+      "path": "examples/claude_code_harbor/ENVIRONMENT.md",
+      "deployed_sha256": "ee28e59a406a641d75329e09d58331eb11dc22a3088aa9bb1457949c8758beb4",
+      "published_sha256": "ee28e59a406a641d75329e09d58331eb11dc22a3088aa9bb1457949c8758beb4",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/nemo_agent.py",
+      "deployed_sha256": "fc5d5f4431fd3b213ee0a313e43557b2c9a89d2fe4089ce1b227efe6d41ba7a2",
+      "published_sha256": "fc5d5f4431fd3b213ee0a313e43557b2c9a89d2fe4089ce1b227efe6d41ba7a2",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/persistent_run_agent.py",
+      "deployed_sha256": "ad2f20c8a6c8f4b0751399c117ae8f8c65c139746a375d68b43d1452d7de5a21",
+      "published_sha256": "20926c0ec222d10eee55f2f1bab39fbe5e8460fe8070008653ed33a1246f9071",
+      "matches_deployed": false,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/relay.py",
+      "deployed_sha256": "7474bdf04a89bff35d77ef85bf93faeb170477e8f991f9b6e46f335536928031",
+      "published_sha256": "7474bdf04a89bff35d77ef85bf93faeb170477e8f991f9b6e46f335536928031",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/run_agent.py",
+      "deployed_sha256": "3bedfac2c048d261d145251fb0abd6eaec477dcb494f20f3956eba5ecda73958",
+      "published_sha256": "3bedfac2c048d261d145251fb0abd6eaec477dcb494f20f3956eba5ecda73958",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/bootstrap_qs.py",
+      "deployed_sha256": "4e1d09af46de8d3aa372f35833934a32fd25af3cb790b874630c8c10809b26a7",
+      "published_sha256": "4e1d09af46de8d3aa372f35833934a32fd25af3cb790b874630c8c10809b26a7",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/build_gym_environment.py",
+      "deployed_sha256": "89f486ee8c8b05b7c512c7edcdef9165d43382201832810aca799e46fb707deb",
+      "published_sha256": "89f486ee8c8b05b7c512c7edcdef9165d43382201832810aca799e46fb707deb",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/harbor.env.example",
+      "deployed_sha256": "9706b3e43ffe297526d74931b302bb6e2162a8f3c36d8f6140c5b598c6124414",
+      "published_sha256": "9706b3e43ffe297526d74931b302bb6e2162a8f3c36d8f6140c5b598c6124414",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/oci_paths.py",
+      "deployed_sha256": "4a2a3c80619f4f90ad171ed1d6ae8b7a5213efe9e962e7693722a3d54f752769",
+      "published_sha256": "4a2a3c80619f4f90ad171ed1d6ae8b7a5213efe9e962e7693722a3d54f752769",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/prepare_data.py",
+      "deployed_sha256": "8e7c712635c3cb4ecb885586a48e8f442bf6147dbd97b427e8b054ad8cef8d27",
+      "published_sha256": "8e7c712635c3cb4ecb885586a48e8f442bf6147dbd97b427e8b054ad8cef8d27",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/run-harbor.sh",
+      "deployed_sha256": "db70c37f9a3a27b96068496c6078b9b650ae49be39410295713b976598700b36",
+      "published_sha256": "db70c37f9a3a27b96068496c6078b9b650ae49be39410295713b976598700b36",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/run-qwen36-35B-A3B-128xgpu-dump2.sh",
+      "deployed_sha256": "f742d62c52017508d3a22728dea0c3c4361504f77f55b021bef47761b5664b1d",
+      "published_sha256": "f742d62c52017508d3a22728dea0c3c4361504f77f55b021bef47761b5664b1d",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/run-qwen36-35B-A3B-128xgpu.sh",
+      "deployed_sha256": "45690193c00a83650e4bae29757eb1ce652652bf79774344d3a568b888a4fa7e",
+      "published_sha256": "45690193c00a83650e4bae29757eb1ce652652bf79774344d3a568b888a4fa7e",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/source-assets.json",
+      "deployed_sha256": "5d0f3cefc24b59b450089db550f63edde292df7cd0d1768f73cdc20a8fcf0e21",
+      "published_sha256": "5d0f3cefc24b59b450089db550f63edde292df7cd0d1768f73cdc20a8fcf0e21",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/scripts/verify_oci.py",
+      "deployed_sha256": "9d7d5df7da0165d6f33fcca2f9c4a60e4528ace2adff9454c86fd838db6c2a55",
+      "published_sha256": "9d7d5df7da0165d6f33fcca2f9c4a60e4528ace2adff9454c86fd838db6c2a55",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "examples/claude_code_harbor/training_data.py",
+      "deployed_sha256": "5fbca04c94c57402b90e4523356f368a237b3ff53ffa82ba6128ef8e86b6ec01",
+      "published_sha256": "5fbca04c94c57402b90e4523356f368a237b3ff53ffa82ba6128ef8e86b6ec01",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/actor.py",
+      "deployed_sha256": "e34d3cc2fc863a7ce63d32e04e984c0a18edea5122c4173d7d86c18f6ac8b588",
+      "published_sha256": "e34d3cc2fc863a7ce63d32e04e984c0a18edea5122c4173d7d86c18f6ac8b588",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/cp_utils.py",
+      "deployed_sha256": "6e15b60dfb467fa59415e812780313c76445c8dbb595f040ecb8cc204417069e",
+      "published_sha256": "6e15b60dfb467fa59415e812780313c76445c8dbb595f040ecb8cc204417069e",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/data.py",
+      "deployed_sha256": "1dfac6ca3aada5cdb1081970530210dc10e2318222234556603e2085fcc77c40",
+      "published_sha256": "1dfac6ca3aada5cdb1081970530210dc10e2318222234556603e2085fcc77c40",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/loss.py",
+      "deployed_sha256": "681d29b0dd9bf806930141059df1339460765b25f07c78f435210c0a8d0abec0",
+      "published_sha256": "681d29b0dd9bf806930141059df1339460765b25f07c78f435210c0a8d0abec0",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/model.py",
+      "deployed_sha256": "b2b6597ff652819c413e1617079cd1535b7a4f10a75417689ba44562a6a00c85",
+      "published_sha256": "b2b6597ff652819c413e1617079cd1535b7a4f10a75417689ba44562a6a00c85",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/backends/megatron/prompt_loss.py",
+      "deployed_sha256": "6bfe26702156279ef7af8bbd9ed0514c6b9cc8a80d6f7c032f396be81565d9b5",
+      "published_sha256": "6bfe26702156279ef7af8bbd9ed0514c6b9cc8a80d6f7c032f396be81565d9b5",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/utils/arguments.py",
+      "deployed_sha256": "32347eda84721fa147541ae438b07930b23ff267e4d11dfd5f746da63ef84f4e",
+      "published_sha256": "32347eda84721fa147541ae438b07930b23ff267e4d11dfd5f746da63ef84f4e",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/utils/data/stream_dataloader.py",
+      "deployed_sha256": "229e061463f75fccb2c030bdbf925d25d3310c0f6341e5acdbb017f94e038f02",
+      "published_sha256": "229e061463f75fccb2c030bdbf925d25d3310c0f6341e5acdbb017f94e038f02",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "relax/utils/training/train_dump_utils.py",
+      "deployed_sha256": "ae32f0c934bf09c801e9d18388fbf9d6f1bd4b8ee77cf0374ae2561d4b0c699a",
+      "published_sha256": "8defa059f5bb04b5f33b93ea1d2c6738f913f03de491cad5c4ca038ff28ccab1",
+      "matches_deployed": false,
+      "publication_note": "Restore generic dump compatibility around deployed raw helpers."
+    },
+    {
+      "path": "relax/utils/utils.py",
+      "deployed_sha256": "814fa835a3ac07e6987a2a530ec6519b4fbf6ec517f1c61d4bbab5dd1a0bf4df",
+      "published_sha256": "814fa835a3ac07e6987a2a530ec6519b4fbf6ec517f1c61d4bbab5dd1a0bf4df",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "repro/claude-code-harbor-r5/scripts/start_node.sh",
+      "deployed_sha256": "9ccad27346e6d4fc3612d54c218d20403fff6cffc86565c439ba21ec6f5f246c",
+      "published_sha256": "9ccad27346e6d4fc3612d54c218d20403fff6cffc86565c439ba21ec6f5f246c",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "scripts/training/text/run-qwen36-35B-A3B-128xgpu-harbor-dump2.sh",
+      "deployed_sha256": "b6bc059fc1476d84dabad2a2fb6844a85ce395a190badd14ff70f3483f69fc31",
+      "published_sha256": "b6bc059fc1476d84dabad2a2fb6844a85ce395a190badd14ff70f3483f69fc31",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/backends/megatron/test_prompt_equal_loss.py",
+      "deployed_sha256": "63e841713d4c13adf915c77bd0aeed6baecf8f8db69c44e7e46e7721fcfa3576",
+      "published_sha256": "63e841713d4c13adf915c77bd0aeed6baecf8f8db69c44e7e46e7721fcfa3576",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_compaction_contract.py",
+      "deployed_sha256": "369356115b0cdd022087a308db867f064fa44e2b80505ecc499e6fc5f1a82d77",
+      "published_sha256": "369356115b0cdd022087a308db867f064fa44e2b80505ecc499e6fc5f1a82d77",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_local_relay.py",
+      "deployed_sha256": "e8a49cc691897dc863db431b91fecd40aa7d9589dda648b321d76639e9a06b39",
+      "published_sha256": "e8a49cc691897dc863db431b91fecd40aa7d9589dda648b321d76639e9a06b39",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_oci_lifecycle.py",
+      "deployed_sha256": "66400e44f1bd01fef7f2561fc67b04b3332ed2ff0ca170e204aaac6182fc05ae",
+      "published_sha256": "66400e44f1bd01fef7f2561fc67b04b3332ed2ff0ca170e204aaac6182fc05ae",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_training_data.py",
+      "deployed_sha256": "69a9d36bc465bd1a98ef3eb818bfaba31fd0ce00e558f832609b4e7f4859de40",
+      "published_sha256": "69a9d36bc465bd1a98ef3eb818bfaba31fd0ce00e558f832609b4e7f4859de40",
+      "matches_deployed": true,
+      "publication_note": "Copied from frozen v3; any byte difference is required repository formatting."
+    },
+    {
+      "path": "tests/examples/claude_code_harbor/test_persistent_run_agent.py",
+      "deployed_sha256": null,
+      "published_sha256": "71a3fa00ec3d0d8caaafd33a9ca342cfac17c2e4a432ecf256007d01224849b2",
+      "matches_deployed": null,
+      "publication_note": "Added publication regression test; not in frozen release."
+    },
+    {
+      "path": "tests/utils/training/test_raw_agentic_dump.py",
+      "deployed_sha256": null,
+      "published_sha256": "e221d6c2a99859d02b7750b3278d8301c8b489d649bbce37e857f86998b2e14c",
+      "matches_deployed": null,
+      "publication_note": "Added publication regression test; not in frozen release."
+    }
+  ]
+}

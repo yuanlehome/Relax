@@ -9,6 +9,7 @@ keeps streaming clients alive while a resident request is held across steps.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import hmac
 import http.client
@@ -101,6 +102,8 @@ class LocalModelRelay:
         self._tasks: set[_ModelRequest] = set()
         self._lock = threading.Lock()
         self._closed = False
+        self._harvesting = False
+        self._harvest_tasks: list[_ModelRequest] = []
         relay = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -185,7 +188,11 @@ class LocalModelRelay:
                         self._json(502, error)
                 finally:
                     if task is not None:
-                        task.cancel()
+                        # Source finalize waits for an already accepted model
+                        # call even after the budget has stopped the CLI.
+                        with relay._lock:
+                            if not relay._harvesting:
+                                task.cancel()
 
             def _json(self, status: int, payload: dict[str, Any]) -> None:
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -213,7 +220,7 @@ class LocalModelRelay:
     def _submit(self, payload: dict[str, Any]) -> _ModelRequest:
         task = _ModelRequest()
         with self._lock:
-            if self._closed:
+            if self._closed or self._harvesting:
                 raise RuntimeError("Relay closed")
             self._tasks.add(task)
 
@@ -283,6 +290,31 @@ class LocalModelRelay:
             if active_socket is not None:
                 active_socket.close()
             connection.close()
+
+    def begin_harvest(self) -> None:
+        """Fence new calls before stopping the CLI; retain accepted calls."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Cannot harvest a closed relay")
+            if not self._harvesting:
+                self._harvesting = True
+                self._harvest_tasks = list(self._tasks)
+
+    async def finish_harvest(self) -> None:
+        """Wait for canonical responses; transport failures stay failures."""
+        with self._lock:
+            if not self._harvesting:
+                raise RuntimeError("Harvest has not started")
+            pending = list(self._harvest_tasks)
+        for task in pending:
+            # Do not park an executor thread on an unbounded future: DNS or
+            # connect may outlive cancellation, but the Session must not.
+            while not task.future.done():
+                await asyncio.sleep(0.1)
+            status, _ = task.future.result()
+            if status != 200:
+                raise RuntimeError("Accepted model call failed during timeout harvest")
+        self.capture.seal()
 
     def close(self) -> None:
         with self._lock:

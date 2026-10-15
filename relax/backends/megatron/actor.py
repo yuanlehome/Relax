@@ -2505,6 +2505,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.advantage_estimator == "score_centering":
                     data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+                if getattr(self.args, "prompt_equal_loss", False):
+                    data_fields.append("loss_prompt_ids")
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
@@ -2558,6 +2560,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+
+        if getattr(self.args, "prompt_equal_loss", False):
+            from relax.backends.megatron.prompt_loss import apply_prompt_denominators
+
+            apply_prompt_denominators(
+                rollout_data,
+                self.args.global_batch_size,
+                mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+            )
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:

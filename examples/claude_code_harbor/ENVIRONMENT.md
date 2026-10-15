@@ -96,29 +96,148 @@ and writes transfer evidence; it does not overwrite files in the code checkout.
 
 ### Automatic startup on a fresh QS RayJob
 
-After configuring the mounted input and output variables above, the QS RayJob
-entrypoint can run all preparation and training steps in one foreground command:
+The one-command entrypoint takes the **original dataset and model** and runs
+preparation, node services and the existing 128-H800 training recipe. From a
+writable **shared cloud directory on the Ray head**, run:
 
 ```bash
-cd "$CLOUD_ROOT/$REPO"
-python3 -u -m examples.claude_code_harbor.scripts.bootstrap_qs
+bash /path/to/Relax/examples/claude_code_harbor/scripts/run-harbor.sh \
+  --source-root /shared/path/to/original-150037-dataset \
+  --model-dir /shared/path/to/Qwen3.6-35B-A3B
 ```
+
+The model argument also accepts its parent directory. The two-input mode derives
+`CLOUD_ROOT` by matching the original dataset's cloud-relative path recorded in
+`source-assets.json`, creates a unique `harbor-runs/<run>/` beneath
+the working directory for prepared data and the bundle, and keeps checkpoints in
+`harbor-checkpoints/qwen36-35b-a3b-harbor-128h800-hybrid`. Existing checkpoints are
+rejected, not silently resumed. Set `SAVE_DIR` to choose another persistent shared
+checkpoint root; run bundles then go under its parent's `harbor-runs/`. Environment
+settings can override `DATA_ROOT`, `BUNDLE_DIR`, `EXP_NAME` and `CLOUD_ROOT`.
+This preserves the cloud boundary even when the model and dataset are in the same
+project. If the dataset's path within the cloud changes, explicitly set `CLOUD_ROOT`
+and, when needed, `ORIGINAL_CLOUD_ROOT`; do not infer the cloud boundary from the
+model directory.
+Outputs must be separate from source/model/reused inputs and from each other.
+
+The original dataset contains `src_env` placeholders for two runtime wheels.
+`scripts/source-assets.json` records their original **project-relative** locations,
+sizes and SHA-256 values, keyed to the original dataset digest. Preparation resolves
+them beside the source project's `data/rl_dataset/` tree and verifies both files.
+It needs no previously prepared run. Mount the original `logs/rl/` wheel locations
+and other referenced uploads as well as the dataset itself. For a rearranged source
+tree, set `BBS_WHEEL_PATH` and `DRESSAGE_WHEEL_PATH` explicitly.
+
+For more control, copy
+`examples/claude_code_harbor/scripts/harbor.env.example` to a private shell file
+outside Git and fill in the mounted paths. Then run **once on the Ray head**:
+
+```bash
+bash examples/claude_code_harbor/scripts/run-harbor.sh --env-file /path/to/harbor.env
+```
+
+The env file is trusted shell code, sourced with export enabled; paths containing
+spaces must be quoted. `REPO` is the checkout containing this wrapper. Alternatively export the
+variables above, including a stable `EXP_NAME`, and omit `--env-file`.
+Keep credentials in the existing secure environment, not in the template or Git.
+
+Two optional modes use the same entrypoint:
+
+```bash
+# Validate settings and output collisions only: no installs, writes or Ray calls.
+bash examples/claude_code_harbor/scripts/run-harbor.sh --env-file /path/to/harbor.env --check-config
+
+# Prepare shared data, Gym, OCI binaries and token; do not start services/training.
+bash examples/claude_code_harbor/scripts/run-harbor.sh --env-file /path/to/harbor.env --prepare-only
+```
+
+`--check-config` does not establish input completeness, GPU availability or
+service health. Those checks run during preparation and startup. `--prepare-only`
+requires the training image but no Ray connection. For a subsequent training run,
+choose a **new** `BUNDLE_DIR` and reuse the prepared data/Gym explicitly as below.
+
+The entrypoint uses an already allocated Ray cluster; it does not submit a new
+QS task, fetch model weights or install the base training image. For unattended
+execution, use it as the QS RayJob entrypoint, or submit this outer driver through
+Ray Jobs on the dedicated head. Keep that outer job alive through training; a
+transient `qs exec` session is not a durable driver. The Python module entrypoint
+`python3 -u -m examples.claude_code_harbor.scripts.bootstrap_qs` remains available
+with the same modes and exported settings.
 
 Select **16 workers, 8 H800 each**, with the Relax training image. Mount the code,
 original data and all referenced assets, model, and new writable output roots on
 every node. Supply a fresh `DATA_ROOT`, `BUNDLE_DIR`, and `EXP_NAME`; set platform
 restart count to zero. The driver builds inputs/environment once on shared cloud
 storage, waits for all workers, verifies the hardware, then probes user namespaces
-and FUSE. Capable GPU workers run native Gym; other workers and the CPU head use
+and FUSE. It starts one capable GPU worker first and runs a controlled OCI trial
+against its resident Gym, with the model callback bound to the distinct head IP.
+Only after the tool loop, verifier protection and compaction checks pass does it
+start the remaining native Gyms;
+other workers and the CPU head use
 fixed authenticated Gym forwarders. Both ports 27980 (local Gym) and 27981 (native
 uplink) must be available. `GYM_PORT` / `GYM_UPLINK_PORT` can override them.
+Each native uplink and each node-local forwarder then receives a controlled trial
+before training submission. These stub-model validation contexts are recorded
+separately and are not training rollouts or optimizer updates. Raw verification
+artifacts and logs remain private in the bundle.
+
+After the child training job reaches a terminal state, the bootstrap driver stays
+alive holding its ordinary Ray actors and continues checking service health. Its
+`services_retained` stage does not establish training success: inspect the child
+Ray Job status, actual optimizer update count and final checkpoint separately.
+If startup fails after services begin starting, the driver likewise retains its
+actors for inspection; `failed_stage` and `error_type` remain in the status file.
+
+To reuse completed inputs, set these in the env file:
+
+```bash
+HARBOR_REUSE_DATA=1
+DATA_ROOT=path/to/existing/prepared
+GYM_RUNTIME_DIR=path/to/existing/bundle/runtime/gym
+BUNDLE_DIR=path/to/new/run/bundle
+# Optional: verified offline archives for a fresh private OCI binary installation.
+OCI_PACKAGES_DIR=path/to/oci-packages
+```
+
+Data reuse checks manifest-listed file sizes, routing/runtime checksums and model shard presence; raw data and
+wheel settings are then optional. Gym reuse runs the builder's `--check` with a
+private `--check-log` inside the **new** bundle, and repeats that check on native
+nodes. Preserve the Gym venv's original path. No whole-bundle symlinks are needed.
+Leave `GYM_RUNTIME_DIR` unset to build a fresh Gym under the new bundle. OCI binaries
+are always installed into the new bundle from pinned, checksum-verified archives;
+leave `OCI_PACKAGES_DIR` unset to download them. Incomplete builds are never
+silently reused or overwritten.
+
+The driver generates a short, unique node-local `OCI_ROOT` under the system
+temporary directory. It does not include `EXP_NAME`: Docker/containerd append
+socket names, and Linux limits Unix socket paths to 107 bytes plus the terminating
+zero byte. An explicit `OCI_ROOT` is checked before preparation and again before
+node startup, including the containerd debug and ttrpc sockets. Keep this root
+short; shared cloud logs and data still use `BUNDLE_DIR` and `DATA_ROOT`.
 
 Ordinary zero-GPU Ray actors own the services for the lifetime of the foreground
-driver. Once every endpoint is ready, it runs the same `launch.sh` and waits for
-the training Ray job to reach a terminal state. It does not use a placeholder
-sleep, stop after five steps, resume existing outputs, or change the recipe's
-128 optimizer updates. Use a dedicated cluster: the existing training entrypoint
-performs its normal preflight cleanup there.
+driver. Once every endpoint is ready, it runs the same `launch.sh` through
+`scripts/entrypoint/ray-job.sh` and waits for the training Ray job to reach a
+confirmed terminal state. A CLI/log connection failure or unavailable Jobs API
+keeps the driver and its service actors alive while status is retried. The child
+Ray status is recorded separately from measured training progress. Controlled
+OCI and callback checks establish service readiness; full training success still
+requires all 128 actual optimizer updates and a readable final checkpoint, along
+with child Ray `SUCCEEDED`.
+
+Use a dedicated cluster: before starting services and again before submission,
+the bootstrap rejects other active Ray jobs (except itself and an exact
+`sleep infinity` placeholder), occupied GPUs, placement groups or Serve apps.
+The existing training entrypoint still performs its normal cleanup, so do not
+submit concurrent work after admission. The recipe remains 64 actor + 64 rollout
+GPUs and 128 optimizer updates, with ClearML and metrics enabled.
+
+Checkpoints use the stable `SAVE_DIR/EXP_NAME`, save every 16 updates and retain
+two actor checkpoints. A unique child submission ID is recorded separately in
+`bootstrap-status.json`. This entrypoint rejects existing checkpoint directories
+to prevent accidental resume. To intentionally resume, retain `SAVE_DIR` and
+`EXP_NAME` and use the existing `launch.sh` with validated live services; its
+recipe keeps `--load` and `--save` pointed at that stable directory.
 
 `BUNDLE_DIR/bootstrap-status.json` records stages and numeric status. Private
 `bootstrap_logs/` contains preparation/install/launcher output; per-node service

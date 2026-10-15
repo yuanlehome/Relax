@@ -1157,6 +1157,7 @@ def train_one_step(
                     "rollout_topk_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
+                    "prompt_loss_total_tokens",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1166,6 +1167,9 @@ def train_one_step(
             )
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
+
+        if getattr(args, "prompt_equal_loss", False):
+            batch["dynamic_global_batch_size"] = step_global_batch_size
 
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]

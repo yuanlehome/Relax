@@ -66,6 +66,7 @@ from pathlib import Path
 source, destination = map(Path, sys.argv[1:])
 destination.parent.mkdir(parents=True, exist_ok=True)
 temporary = None
+prompt_indices = {}
 try:
     with source.open(encoding="utf-8") as inputs, tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=destination.parent, delete=False
@@ -76,6 +77,11 @@ try:
                 continue
             row = json.loads(line)
             metadata = dict(row.get("metadata") or {})
+            instance_id = metadata.get("instance_id")
+            if not isinstance(instance_id, str) or not instance_id:
+                raise ValueError("Prompt-equal loss requires the source instance_id")
+            metadata["_loss_prompt_index"] = prompt_indices.setdefault(instance_id, len(prompt_indices))
+            metadata["harbor_backend_timeout_s"] = 7200
             for key in (
                 "agent_mode", "env_type", "env_args", "tool_set", "agent_id", "reward_fn", "blackbox_type", "task_type"
             ):
@@ -163,6 +169,7 @@ GRPO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
+   --prompt-equal-loss
 )
 
 OPTIMIZER_ARGS=(
@@ -182,7 +189,7 @@ PERF_ARGS=(
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 32
-   # Required by Relax's Megatron-Bridge CP path; see README.md on loss reduction.
+   # MCore's CP contract stays enabled; prompt-equal loss cancels its token denominator.
    --calculate-per-token-loss
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
