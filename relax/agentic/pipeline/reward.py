@@ -48,6 +48,8 @@ class RewardDomain:
             self.custom_advantage_func = load_function(custom_advantage_path)
         self._group_filter = group_filter if rollout_mode == "train" else None
         self._metric_gatherer = MetricGatherer()
+        self._pre_filter_raw_reward_sum = 0.0
+        self._pre_filter_raw_reward_count = 0
         self._scored_session_ids: set[str] = set()
         self._progress_callback: Callable[[], None] = lambda: None
 
@@ -112,6 +114,12 @@ class RewardDomain:
             sample.reward = reward
             mark_sample_agentic_event(sample, "reward_end_at", reward_end_at)
 
+    def observe_pre_filter_raw_reward(self, group: GroupExport) -> None:
+        for sample in group.samples:
+            if sample.reward is not None:
+                self._pre_filter_raw_reward_sum += sample.get_reward_value(self.args)
+                self._pre_filter_raw_reward_count += 1
+
     async def apply_custom_advantage(self, group: GroupExport) -> bool:
         """Write per-export custom advantage values or reject the whole
         Group."""
@@ -158,9 +166,15 @@ class RewardDomain:
             for sample in samples:
                 mark_sample_agentic_event(sample, "group_finalize_end_at", finalize_end_at)
 
-    def collect_metrics(self) -> dict[str, int]:
+    def collect_metrics(self) -> dict[str, int | float]:
         metrics = self._metric_gatherer.collect()
         self._metric_gatherer = MetricGatherer()
+        if self._pre_filter_raw_reward_count:
+            metrics["rollout/pre_filter/raw_reward"] = (
+                self._pre_filter_raw_reward_sum / self._pre_filter_raw_reward_count
+            )
+        self._pre_filter_raw_reward_sum = 0.0
+        self._pre_filter_raw_reward_count = 0
         return metrics
 
     async def _score_session(

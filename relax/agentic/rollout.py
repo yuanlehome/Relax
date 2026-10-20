@@ -95,6 +95,7 @@ async def _run_group(
 
         if reward_domain.group_rm:
             await reward_domain.score_group(group)
+        reward_domain.observe_pre_filter_raw_reward(group)
         if reward_domain.custom_advantage_func is not None and not await reward_domain.apply_custom_advantage(group):
             reward_domain.discard_group_progress(stream)
             return None

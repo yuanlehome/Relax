@@ -1,0 +1,27 @@
+claude_code:
+  max_turns: 20
+  max_output_tokens: 8192
+  max_retries: 0
+  attribution_header: 0
+  auto_compact_window: 200000
+  disable_auto_memory: 1
+  disable_cron: 1
+  disable_git_instructions: 1
+  disallowed_tools: WebSearch,WebFetch,AskUserQuestion,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree
+  skill_overrides:
+    update-config: "off"
+    keybindings-help: "off"
+    fewer-permission-prompts: "off"
+    claude-api: "off"
+    init: "off"
+    security-review: "off"
+
+apptainer:
+  pids_limit: 512
+
+task:
+  cpus: 4
+  memory_mb: 8192
+  build_timeout_sec: 7200
+  agent_timeout_sec: 7200
+  verifier_timeout_sec: 1800
