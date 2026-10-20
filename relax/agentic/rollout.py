@@ -191,6 +191,7 @@ async def _run_group(
                 if sample.reward is not None:
                     async with observe_reward([sample]):
                         pass
+        reward_domain.observe_pre_filter_raw_reward(group)
         if reward_domain.custom_advantage_func is not None:
             async with observe_filter(group, "custom_advantage") as result:
                 accepted = await reward_domain.apply_custom_advantage(group)
