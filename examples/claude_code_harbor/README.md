@@ -81,11 +81,14 @@ Harbor venv和Claude Code runtime都安装在`/data/temp/wulumeng/claude-code-ha
 ### Apptainer
 
 ```bash
+apptainer config global --set "max loop devices" 8192
 apptainer config global --set "systemd cgroups" no
 apptainer config global --set "sessiondir max size" 8192
 apptainer config global --set "mount slave" no
 sysctl -w user.max_user_namespaces=65536
 ```
+
+`max loop devices`是Apptainer可使用的loop device上限；设备仍由内核按需创建，设置为8192不会在启动时预创建8192个设备。
 
 外层Pod需要可写或已委派的`cpu`、`memory`和`pids` cgroup subtree。
 
