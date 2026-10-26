@@ -18,6 +18,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 PROJECT_NAME="${PROJECT_NAME:-Relax/agentic/claude-code-harbor}"
 EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-claude-code-harbor-16xh800-hybrid}"
+MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-32768}"
+MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-61440}"
 now=$(date "+%Y%m%d-%H%M%S")
 RUN_ROOT="${RUN_ROOT:-${SCRIPT_DIR}/log}"
 RUN_DIR="${RUN_ROOT%/}/${EXP_NAME}-${now}"
@@ -42,23 +44,25 @@ ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_DATA}"
    --rollout-shuffle
    --num-rollout 128
-   --rollout-batch-size 2
-   --n-samples-per-prompt 8
-   --global-batch-size 16
-   --rollout-max-response-len 8192
-   --rollout-max-context-len 262144
+   --rollout-batch-size 4
+   --n-samples-per-prompt 16
+   --global-batch-size 64
+   --rollout-max-response-len "${MAX_OUTPUT_TOKENS}"
+   --rollout-max-context-len "${MAX_CONTEXT_TOKENS}"
 )
 
 AGENTIC_ARGS=(
    --use-agentic-rollout
+   --agentic-prelaunch
+   --agentic-session-lifecycle
    --agent-command "${AGENT_COMMAND}"
    --agent-cwd "${RELAX_ROOT}"
-   --agentic-concurrency 2
-   --agent-timeout 10800
-   --agentic-reasoning-parser qwen3
+   --agent-timeout 3600
+   --agentic-reasoning-parser qwen3-thinking
    --agentic-tool-call-parser qwen3_coder
    --agentic-custom-advantage-path examples.claude_code_harbor.advantage.advantage_func
    --agent-env
+   "MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS}"
    "HARBOR_TASK_ROOT=${HARBOR_TASK_ROOT}"
    "HARBOR_SIF_CACHE_ROOT=${HARBOR_SIF_CACHE_ROOT}"
 )
@@ -82,6 +86,7 @@ OPTIMIZER_ARGS=(
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
+   --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
 )
 
 PERF_ARGS=(
@@ -97,9 +102,8 @@ PERF_ARGS=(
    # Release cached allocations before first gradient-sync NCCL allocation.
    --empty-unused-memory-level 1
    --use-dynamic-batch-size
-   # Preserve the 262144-token context across CP4; both budgets are multiples of TP2 * 128.
-   --max-tokens-per-gpu 65536
-   --log-probs-max-tokens-per-gpu 65536
+   --max-tokens-per-gpu 15360
+   --log-probs-max-tokens-per-gpu 8192
    --log-probs-chunk-size 32
    --qkv-format thd
    --moe-flex-dispatcher-backend deepep
@@ -112,9 +116,9 @@ PERF_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
    --sglang-mem-fraction-static 0.85
-   --sglang-context-length 262144
-   --sglang-max-running-requests 16
-   --sglang-server-concurrency 16
+   --sglang-context-length "${MAX_CONTEXT_TOKENS}"
+   --sglang-enable-session-radix-cache
+   --sglang-radix-eviction-policy priority
    --sglang-router-policy consistent_hashing
    --sglang-log-level warning
 )

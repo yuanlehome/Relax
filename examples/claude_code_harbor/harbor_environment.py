@@ -26,7 +26,7 @@ class BoundedApptainerEnvironment(SingularityEnvironment):
     """Adapt Harbor's Singularity backend to a bounded Relax Session.
 
     Harbor's default launch omits cgroup limits and preserves converted images.
-    This variant adds CPU/memory/PID limits, a leased rootfs, the prepared MiMo
+    This variant adds CPU/memory/PID limits, a leased SIF, the prepared MiMo
     runtime and an authenticated server, then cleans up within Relax's TERM
     window.
     """
@@ -82,23 +82,37 @@ class BoundedApptainerEnvironment(SingularityEnvironment):
         shutil.copy(Path(__file__).with_name("sif_cache.py"), self._staging_dir / "execution_server.py")
         (self._staging_dir / "server-token").write_text(self._exec_token)
         recipe = Path(__file__).parent
+        system_prompt = self._staging_dir / "system_prompt.txt"
+        system_prompt_target = "/run/claude-code-system-prompt.txt"
         shutil.copy(recipe / "bootstrap.sh", self._staging_dir / "bootstrap.sh")
+        system_prompt.write_text((recipe / "system_prompt.txt").read_text().rstrip("\n"))
         shutil.copy(self.environment_dir.parent / "tests/git_targets.json", self._staging_dir / "git_targets.json")
         protected = '"/opt/mimo-verifier-state"'
-        wrapper = (
-            (installed / "tmp/claude_srt_wrapper.sh")
-            .read_text()
-            .replace(
-                protected, '"/staging", "/run/agent-runtime", "/run/harbor-image.lock", "/opt/python", ' + protected
-            )
-            .replace('"enableWeakerNestedSandbox": true', '"enableWeakerNestedSandbox": false')
+        claude_exec = 'exec "$SRT_BIN" --settings "$SETTINGS" -- "$REAL" "$@"'
+        source_wrapper = (installed / "tmp/claude_srt_wrapper.sh").read_text()
+        if claude_exec not in source_wrapper:
+            raise RuntimeError("Claude SRT wrapper does not match the expected command")
+        claude_command = claude_exec[len("exec ") :].replace(
+            '"$@"', f'--system-prompt-file {system_prompt_target} "$@"'
         )
+        normalized_claude_exec = (
+            f"if {claude_command}; then\n"
+            "  claude_exit_code=0\n"
+            "else\n"
+            "  claude_exit_code=$?\n"
+            "fi\n"
+            # Preserve Claude's exit status for diagnostics while allowing Harbor to run the verifier.
+            "printf '%s\\n' \"$claude_exit_code\" > /logs/agent/claude-exit-code.txt\n"
+            "exit 0"
+        )
+        wrapper = source_wrapper.replace(
+            protected, '"/staging", "/run/agent-runtime", "/run/harbor-image.lock", "/opt/python", ' + protected
+        ).replace(claude_exec, normalized_claude_exec)
         (self._staging_dir / "claude_wrapper.sh").write_text(wrapper)
 
-        reserved_socket, self._server_port = self._reserve_port()
         bind_mounts = ["-B", f"{self._staging_dir}:/staging"]
+        bind_mounts.extend(["-B", f"{system_prompt}:{system_prompt_target}:ro"])
         bind_mounts.extend(["-B", f"{sandbox_tmp}:/tmp"])
-        bind_mounts.extend(["-B", "/proc:/proc"])
         bind_mounts.extend(["-B", f"{self._image_lease.lock_path}:/run/harbor-image.lock:ro"])
         bind_mounts.extend(["-B", f"{installed}:/run/agent-runtime:ro"])
         bind_mounts.extend(["-B", f"{installed / 'opt/python'}:/opt/python:ro"])
@@ -109,16 +123,7 @@ class BoundedApptainerEnvironment(SingularityEnvironment):
                 mode = ":ro" if mount.get("read_only") else ""
                 bind_mounts.extend(["-B", f"{mount['source']}:{mount['target']}{mode}"])
 
-        no_mount_args = [
-            "--no-mount",
-            "home",
-            "--no-mount",
-            "tmp",
-            "--no-mount",
-            "proc",
-            "--no-mount",
-            "bind-paths",
-        ]
+        no_mount_args = ["--no-mount", "home", "--no-mount", "tmp", "--no-mount", "bind-paths"]
         resource_args = [
             "--pids-limit",
             str(self._pids_limit),
@@ -130,66 +135,110 @@ class BoundedApptainerEnvironment(SingularityEnvironment):
             f"{self._effective_memory_mb}M",
         ]
 
-        bootstrap_cmd = [
-            "bash",
-            "/staging/bootstrap.sh",
-            "/staging/execution_server.py",
-            "serve",
-            "--port",
-            str(self._server_port),
-            "--workdir",
-            self._workdir,
-        ]
-        command = [
-            "apptainer",
-            "exec",
-            *resource_args,
-            *no_mount_args,
-            "--pwd",
-            self._workdir,
-            "--writable-tmpfs",
-            "--keep-privs",
-            "--contain",
-            "--ipc",
-            "--cleanenv",
-            "--no-home",
-            *bind_mounts,
-            str(self._sif_path),
-            *bootstrap_cmd,
-        ]
+        max_port_retries = 3
+        last_error = None
+        for port_attempt in range(max_port_retries):
+            self._server_output_tail.clear()
+            reserved_socket, self._server_port = self._reserve_port()
+            bootstrap_cmd = [
+                "bash",
+                "/staging/bootstrap.sh",
+                "/staging/execution_server.py",
+                "serve",
+                "--port",
+                str(self._server_port),
+                "--workdir",
+                self._workdir,
+            ]
+            command = [
+                "apptainer",
+                "exec",
+                *resource_args,
+                *no_mount_args,
+                "--pwd",
+                self._workdir,
+                "--writable-tmpfs",
+                "--contain",
+                "--pid",
+                "--cleanenv",
+                "--no-home",
+                *bind_mounts,
+                str(self._sif_path),
+                *bootstrap_cmd,
+            ]
 
-        reserved_socket.close()
-        supervisor = [
-            sys.executable,
-            str(Path(__file__).with_name("sif_cache.py")),
-            "run",
-            str(os.getpid()),
-            *command,
-        ]
-        self._server_process = await asyncio.create_subprocess_exec(
-            *supervisor,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-        self._stream_task = asyncio.create_task(self._stream_server_output())
-        self._http_client = httpx.AsyncClient(timeout=30.0, headers={"Authorization": f"Bearer {self._exec_token}"})
+            self.logger.debug(
+                f"Starting Apptainer execution server on port {self._server_port} "
+                f"(attempt {port_attempt + 1}/{max_port_retries})"
+            )
+            reserved_socket.close()
+            supervisor = [
+                sys.executable,
+                str(Path(__file__).with_name("sif_cache.py")),
+                "run",
+                str(os.getpid()),
+                *command,
+            ]
+            self._server_process = await asyncio.create_subprocess_exec(
+                *supervisor,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            self._stream_task = asyncio.create_task(self._stream_server_output())
+            self._http_client = httpx.AsyncClient(
+                timeout=30.0, headers={"Authorization": f"Bearer {self._exec_token}"}
+            )
 
-        for _ in range(int(self.task_env_config.build_timeout_sec)):
-            if self._server_process.returncode is not None:
-                await self._stream_task
-                diagnostic = "\n".join(self._server_output_tail)
-                raise RuntimeError(
-                    f"Bounded Apptainer server exited during startup ({self._server_process.returncode})\n{diagnostic}"
-                )
-            try:
-                response = await self._http_client.get(f"http://127.0.0.1:{self._server_port}/health")
-                if response.status_code == 200:
-                    return
-            except httpx.RequestError:
-                pass
-            await asyncio.sleep(1)
-        raise RuntimeError("Bounded Apptainer server did not become ready")
+            server_ready = False
+            for _ in range(60):
+                try:
+                    response = await self._http_client.get(f"http://127.0.0.1:{self._server_port}/health")
+                    if response.status_code == 200:
+                        if self._server_process.returncode is not None:
+                            await self._stream_task
+                            last_error = RuntimeError(
+                                f"Port collision on {self._server_port}: health check succeeded "
+                                "but our server process died"
+                            )
+                            self.logger.warning(
+                                f"Health check reached another server on port {self._server_port}; retrying"
+                            )
+                            break
+                        server_ready = True
+                        break
+                except httpx.RequestError:
+                    pass
+
+                if self._server_process.returncode is not None:
+                    await self._stream_task
+                    diagnostic = "\n".join(self._server_output_tail)
+                    last_error = RuntimeError(
+                        f"Bounded Apptainer server exited during startup ({self._server_process.returncode})\n"
+                        f"{diagnostic}"
+                    )
+                    self.logger.warning(
+                        f"Execution server failed on port {self._server_port}; retrying with a new port"
+                    )
+                    break
+                await asyncio.sleep(1)
+
+            if server_ready:
+                return
+
+            if self._server_process.returncode is None:
+                os.killpg(self._server_process.pid, signal.SIGKILL)
+                await self._server_process.wait()
+            if not self._stream_task.done():
+                self._stream_task.cancel()
+                await asyncio.gather(self._stream_task, return_exceptions=True)
+
+            await self._http_client.aclose()
+            self._http_client = None
+            self._server_process = None
+            self._stream_task = None
+
+        raise last_error or RuntimeError("Bounded Apptainer server failed to start after retries")
 
     async def _stream_server_output(self) -> None:
         if not self._server_process or not self._server_process.stdout:

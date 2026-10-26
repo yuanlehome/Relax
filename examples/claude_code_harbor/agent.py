@@ -16,6 +16,9 @@ import yaml
 from examples.claude_code_harbor.proxy import LocalModelProxy
 
 
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
+
 def _atomic_output(path: Path, records: list[dict[str, Any]]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -31,6 +34,7 @@ def _trial_config(task: Path, session_dir: Path, base_url: str) -> Any:
         ResourceMode,
         TaskConfig,
         TrialConfig,
+        VerifierConfig,
     )
 
     config = yaml.safe_load(Path(__file__).with_name("config.yaml").read_text())
@@ -40,29 +44,46 @@ def _trial_config(task: Path, session_dir: Path, base_url: str) -> Any:
         model_name="anthropic/relax_model",
         model_base_url=base_url,
         model_api_key_name="ANTHROPIC_AUTH_TOKEN",
+        override_timeout_sec=config["task"]["agent_timeout_sec"],
         env={
             "ANTHROPIC_AUTH_TOKEN": session_id,
             "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
-            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(config["claude_code"]["max_output_tokens"]),
-            "CLAUDE_CODE_MAX_RETRIES": str(config["claude_code"]["max_retries"]),
-            "CLAUDE_CODE_ATTRIBUTION_HEADER": str(config["claude_code"]["attribution_header"]),
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(config["claude_code"]["auto_compact_window"]),
-            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": str(config["claude_code"]["disable_auto_memory"]),
-            "CLAUDE_CODE_DISABLE_CRON": str(config["claude_code"]["disable_cron"]),
-            "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": str(config["claude_code"]["disable_git_instructions"]),
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": os.environ["MAX_OUTPUT_TOKENS"],
+            "CLAUDE_CODE_MAX_RETRIES": "0",
+            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(config["claude_code"]["max_context_tokens"]),
+            "CLAUDE_CODE_MODEL_CAPABILITIES": "-mid_conv_system",
+            "CLAUDE_CODE_SHELL": "/bin/bash",
+            "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT": "1",
+            "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+            "CLAUDE_CODE_DISABLE_CRON": "1",
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
+            "CLAUDE_CODE_DISABLE_WORKFLOWS": "1",
+            "DISABLE_UPDATES": "1",
             "API_TIMEOUT_MS": "2147483647",
+            "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "2147483647",
         },
         kwargs={
             "max_turns": config["claude_code"]["max_turns"],
+            "permission_mode": "dontAsk",
+            "allowed_tools": config["claude_code"]["allowed_tools"],
             "disallowed_tools": config["claude_code"]["disallowed_tools"],
-            "config": {"skillOverrides": config["claude_code"]["skill_overrides"]},
+            "config": {
+                "autoCompactEnabled": True,
+                "skillOverrides": config["claude_code"]["skill_overrides"],
+            },
         },
     )
     environment = EnvironmentConfig(
         import_path="examples.claude_code_harbor.harbor_environment:BoundedApptainerEnvironment",
         cpu_enforcement_policy=ResourceMode.LIMIT,
         memory_enforcement_policy=ResourceMode.LIMIT,
+        override_cpus=config["task"]["cpus"],
+        override_memory_mb=config["task"]["memory_mb"],
         kwargs={"pids_limit": config["apptainer"]["pids_limit"]},
     )
     return TrialConfig(
@@ -71,6 +92,7 @@ def _trial_config(task: Path, session_dir: Path, base_url: str) -> Any:
         trials_dir=session_dir / "harbor-trials",
         agent=agent,
         environment=environment,
+        verifier=VerifierConfig(override_timeout_sec=config["task"]["verifier_timeout_sec"]),
     )
 
 
@@ -125,24 +147,20 @@ async def main_async() -> None:
 
     parent_watch = asyncio.create_task(watch_parent(), name=f"relax-parent:{parent_pid}")
 
-    proxy = LocalModelProxy(
-        os.environ["RELAX_BASE_URL"],
-        os.environ["RELAX_SESSION_ID"],
-    )
+    proxy = LocalModelProxy(os.environ["RELAX_BASE_URL"], os.environ["RELAX_SESSION_ID"])
     proxy.start()
 
     try:
         result = await _run_trial(_trial_config(task, session_dir, proxy.base_url), stop)
-        if result.exception_info is not None:
-            info = result.exception_info
+        info = result.exception_info
+        if info is not None and info.exception_type == "VerifierTimeoutError":
+            reward = 0.0
+        elif result.verifier_result is None:
             raise RuntimeError(
                 f"Harbor Trial failed: {info.exception_type}: {info.exception_message}\n{info.exception_traceback}"
             )
-        if result.verifier_result is None:
-            raise RuntimeError("Harbor Trial completed without a verifier result")
-        if "reward" not in result.verifier_result.rewards:
-            raise RuntimeError("Harbor verifier result is missing the 'reward' key")
-        reward = result.verifier_result.rewards["reward"]
+        else:
+            reward = result.verifier_result.rewards["reward"]
     finally:
         parent_watch.cancel()
         await asyncio.gather(parent_watch, return_exceptions=True)

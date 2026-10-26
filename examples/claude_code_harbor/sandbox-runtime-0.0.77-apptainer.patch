@@ -1,0 +1,88 @@
+diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-utils.js
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -2330,6 +2330,45 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
+     }
+     return args;
+ }
++/**
++ * Avoid recursively binding an Apptainer overlay root into a nested user
++ * namespace. Keep the container-visible filesystem while omitting control
++ * mounts that the MiMo wrapper already treats as private.
++ */
++function containerScopedFilesystemArgs(args) {
++    const rewritten = ['--tmpfs', '/', '--dev-bind', '/dev', '/dev'];
++    const omitted = new Set(['dev', 'proc', 'run', 'staging', 'tmp']);
++    for (const name of fs.readdirSync('/').sort()) {
++        if (omitted.has(name))
++            continue;
++        const source = `/${name}`;
++        let info;
++        try {
++            info = fs.lstatSync(source);
++        }
++        catch {
++            continue;
++        }
++        if (info.isSymbolicLink()) {
++            rewritten.push('--symlink', fs.readlinkSync(source), source);
++        }
++        else if (info.isDirectory() || info.isFile()) {
++            rewritten.push(name === 'sys' ? '--ro-bind' : '--bind', source, source);
++        }
++    }
++    rewritten.push('--tmpfs', '/run', '--bind', '/tmp', '/tmp');
++    for (let index = 0; index < args.length;) {
++        if ((args[index] === '--bind' || args[index] === '--ro-bind') &&
++            args[index + 1] === '/' &&
++            args[index + 2] === '/') {
++            index += 3;
++            continue;
++        }
++        rewritten.push(args[index]);
++        index += 1;
++    }
++    return rewritten;
++}
+ /**
+  * Wrap a command with sandbox restrictions on Linux
+  *
+@@ -2542,12 +2581,17 @@ export async function wrapCommandWithSandboxLinux(params) {
+             // If no sockets provided, network is completely blocked (--unshare-net without proxy)
+         }
+         // ========== FILESYSTEM RESTRICTIONS ==========
+-        const fsArgs = await generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal);
++        let fsArgs = await generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig, mandatoryDenySearchDepth, allowGitConfig, abortSignal);
++        if (enableWeakerNestedSandbox) {
++            fsArgs = containerScopedFilesystemArgs(fsArgs);
++        }
+         const mountsStart = bwrapArgs.length;
+         bwrapArgs.push(...fsArgs);
+         const mounts = { start: mountsStart, end: bwrapArgs.length };
+         // Always bind /dev
+-        bwrapArgs.push('--dev', '/dev');
++        if (!enableWeakerNestedSandbox) {
++            bwrapArgs.push('--dev', '/dev');
++        }
+         // ========== PID NAMESPACE ISOLATION ==========
+         // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work
+         // By default, always unshare PID namespace and mount fresh /proc.
+diff --git a/dist/sandbox/sandbox-utils.js b/dist/sandbox/sandbox-utils.js
+--- a/dist/sandbox/sandbox-utils.js
++++ b/dist/sandbox/sandbox-utils.js
+@@ -659,11 +659,11 @@ export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath,
+     envVars.push(`NO_PROXY=${noProxyAddresses}`);
+     envVars.push(`no_proxy=${noProxyAddresses}`);
+     if (httpProxyPort) {
+-        envVars.push(`HTTP_PROXY=http://${auth}localhost:${httpProxyPort}`);
+-        envVars.push(`HTTPS_PROXY=http://${auth}localhost:${httpProxyPort}`);
++        envVars.push(`HTTP_PROXY=http://${auth}127.0.0.1:${httpProxyPort}`);
++        envVars.push(`HTTPS_PROXY=http://${auth}127.0.0.1:${httpProxyPort}`);
+         // Lowercase versions for compatibility with some tools
+-        envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`);
+-        envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`);
++        envVars.push(`http_proxy=http://${auth}127.0.0.1:${httpProxyPort}`);
++        envVars.push(`https_proxy=http://${auth}127.0.0.1:${httpProxyPort}`);
+         if (proxyAuthToken) {
+             // Pre-send Basic so git never gets a 407 and never invokes a
+             // credential helper for the proxy URL (Windows GCM intercepts the

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Manage worker-local Apptainer rootfs leases and container-held locks."""
+"""Manage worker-local Apptainer SIF leases and container-held locks."""
 
 from __future__ import annotations
 
@@ -63,8 +63,8 @@ class SifCache:
         return hashlib.sha256(reference.encode()).hexdigest()
 
     def _ready(self, key: str) -> Path | None:
-        path = self.root / "images" / f"{key}.rootfs"
-        return path if path.is_dir() else None
+        path = self.root / "images" / f"{key}.sif"
+        return path if path.is_file() else None
 
     def _discard_if_idle(self, key: str) -> None:
         with _open_lock(self.root / "locks" / f"{key}.lock") as lock:
@@ -72,12 +72,11 @@ class SifCache:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            path = self.root / "images" / f"{key}.rootfs"
-            if path.exists():
-                shutil.rmtree(path)
+            path = self.root / "images" / f"{key}.sif"
+            path.unlink(missing_ok=True)
 
     def _sweep_idle(self) -> None:
-        for path in (self.root / "images").glob("*.rootfs"):
+        for path in (self.root / "images").glob("*.sif"):
             self._discard_if_idle(path.stem)
         for work in (self.root / "work").iterdir():
             with _open_lock(self.root / "locks" / f"{work.name}.build.lock") as lock:
@@ -111,7 +110,7 @@ class SifCache:
             output, _ = await process.communicate()
             if process.returncode:
                 raise RuntimeError(
-                    f"Rootfs builder failed ({process.returncode}): {output[-4096:].decode(errors='replace')}"
+                    f"SIF builder failed ({process.returncode}): {output[-4096:].decode(errors='replace')}"
                 )
         finally:
             cleanup = asyncio.create_task(stop())
@@ -120,7 +119,7 @@ class SifCache:
             except asyncio.CancelledError:
                 await cleanup
                 raise
-        return work / "rootfs"
+        return work / "image.sif"
 
     @asynccontextmanager
     async def acquire(self, reference: str) -> AsyncIterator[ImageLease]:
@@ -141,19 +140,18 @@ class SifCache:
                     work = self.root / "work" / key
                     if work.exists():
                         shutil.rmtree(work)
-                    incomplete = self.root / "images" / f"{key}.rootfs"
-                    if incomplete.exists():
-                        shutil.rmtree(incomplete)
+                    incomplete = self.root / "images" / f"{key}.sif"
+                    incomplete.unlink(missing_ok=True)
                     self._sweep_idle()
                     work.mkdir(mode=0o700)
                     try:
                         generated = await self._build(work, reference, (build_lock.fileno(), use_lock.fileno()))
-                        generated.chmod(0o555)
-                        path = self.root / "images" / f"{key}.rootfs"
+                        generated.chmod(0o444)
+                        path = self.root / "images" / f"{key}.sif"
                         generated.replace(path)
                     finally:
                         shutil.rmtree(work)
-                    # The image build lock keeps the rootfs published while EX is downgraded to SH.
+                    # The image build lock keeps the SIF published while EX is downgraded to SH.
                     fcntl.flock(use_lock, fcntl.LOCK_SH)
                 build_lock.close()
                 build_lock = None
@@ -165,14 +163,14 @@ class SifCache:
             try:
                 self._discard_if_idle(key)
             except OSError as error:
-                warnings.warn(f"Idle rootfs cleanup deferred: {error}", RuntimeWarning, stacklevel=2)
+                warnings.warn(f"Idle SIF cleanup deferred: {error}", RuntimeWarning, stacklevel=2)
 
 
 def build(work: Path, executable: str, reference: str, parent_pid: int) -> None:
     """Own one pull process and its locks until conversion cleanup
     completes."""
     if os.getppid() != parent_pid:
-        raise RuntimeError("Rootfs builder lost its requesting adapter")
+        raise RuntimeError("SIF builder lost its requesting adapter")
     stopped = False
 
     def request_stop(_sig, _frame):
@@ -189,10 +187,9 @@ def build(work: Path, executable: str, reference: str, parent_pid: int) -> None:
     }
     command = [
         executable,
-        "build",
+        "pull",
         "--disable-cache",
-        "--sandbox",
-        str(work / "rootfs"),
+        str(work / "image.sif"),
         f"docker://{reference}",
     ]
     with (work / "pull.log").open("wb") as log:

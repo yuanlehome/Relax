@@ -1,27 +1,33 @@
 claude_code:
-  max_turns: 20
-  max_output_tokens: 8192
-  max_retries: 0
-  attribution_header: 0
-  auto_compact_window: 200000
-  disable_auto_memory: 1
-  disable_cron: 1
-  disable_git_instructions: 1
-  disallowed_tools: WebSearch,WebFetch,AskUserQuestion,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree
+  max_turns: 200
+  max_context_tokens: 57344
+  allowed_tools: Bash,Read,Edit,Write,Glob,Grep,TaskCreate,TaskGet,TaskList,TaskUpdate,Skill
+  disallowed_tools: ListAgents,ReportFindings,SendMessage,WebSearch,WebFetch,AskUserQuestion,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,ScheduleWakeup,TaskOutput,TaskStop,mcp__*
   skill_overrides:
-    update-config: "off"
-    keybindings-help: "off"
-    fewer-permission-prompts: "off"
+    auto-mode-setup: "off"
+    batch: "off"
     claude-api: "off"
+    code-review: "off"
+    dataviz: "off"
+    debug: "off"
+    doctor: "off"
+    fewer-permission-prompts: "off"
     init: "off"
+    keybindings-help: "off"
+    loop: "off"
+    plugin-authoring: "off"
+    run: "on"
+    run-skill-generator: "off"
     security-review: "off"
+    simplify: "off"
+    update-config: "off"
+    verify: "on"
 
 apptainer:
-  pids_limit: 512
+  pids_limit: 8192
 
 task:
   cpus: 4
-  memory_mb: 8192
-  build_timeout_sec: 7200
-  agent_timeout_sec: 7200
-  verifier_timeout_sec: 1800
+  memory_mb: 32768
+  agent_timeout_sec: 864000
+  verifier_timeout_sec: 180
