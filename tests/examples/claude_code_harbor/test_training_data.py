@@ -113,10 +113,11 @@ def test_shared_response_hashes_are_scoped_to_each_logical_session() -> None:
     assert sum(sum(mask) for mask in result["loss_masks"]) == 16
 
 
-def test_budget_harvest_preserves_real_tokens_and_marks_all_contexts_truncated() -> None:
+@pytest.mark.parametrize("reason", ["backend_timeout", "max_turns"])
+def test_budget_harvest_preserves_real_tokens_and_marks_all_contexts_truncated(reason: str) -> None:
     samples = branched_samples()
     for sample in samples:
-        sample.metadata.update(termination_reason="backend_timeout", outcome_reward=0.0, _loss_prompt_index=7)
+        sample.metadata.update(termination_reason=reason, outcome_reward=0.0, _loss_prompt_index=7)
     original = copy.deepcopy(samples)
     config = args()
     config.prompt_equal_loss = True

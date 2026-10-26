@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 
+if __package__:
+    from .cli_lifecycle import monitor_cli
+else:
+    from cli_lifecycle import monitor_cli
+
+
 def execute(argv: list[str], *, log: str, timeout: float | None, **kwargs: Any) -> int:
     with Path(log).open("ab") as output:
         return subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, **kwargs).returncode
@@ -99,6 +105,9 @@ def run_command(command: dict[str, Any]) -> dict[str, Any]:
             timeout: float | None = 120
             options: dict[str, Any] = {}
         else:
+            max_turns = command["max_turns"]
+            if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns <= 0:
+                raise ValueError("max_turns must be a positive integer")
             argv = [
                 "/usr/local/bin/claude",
                 "--verbose",
@@ -108,12 +117,19 @@ def run_command(command: dict[str, Any]) -> dict[str, Any]:
                 "--disallowedTools",
                 command["disallowed_tools"],
                 "--permission-mode=bypassPermissions",
+                "--max-turns",
+                str(max_turns),
                 "--print",
             ]
             # Runtime owns the active-time deadline. A separate wall deadline
             # would also charge cross-step holds and weight synchronization.
             timeout = None
-            options = {"input": command["instruction"].encode("utf-8")}
+            instruction = command["instruction"]
+            # Claude print mode parses a leading slash as a local command,
+            # even on stdin. Preserve the task text after a neutral prefix.
+            if instruction.lstrip().startswith("/"):
+                instruction = "Task instruction:\n\n" + instruction
+            options = {"input": instruction.encode("utf-8")}
         try:
             if operation == "agent":
                 with Path("/logs/agent/claude-code.txt").open("ab") as output:
@@ -125,21 +141,19 @@ def run_command(command: dict[str, Any]) -> dict[str, Any]:
                         child = subprocess.Popen(
                             argv,
                             stdin=instruction,
-                            stdout=output,
-                            stderr=output,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                             cwd=command["workdir"],
                             env=environment,
                         )
-                        while child.poll() is None:
-                            if Path("/run/relax-control/stop-agent").exists():
-                                child.terminate()
-                                break
-                            time.sleep(0.2)
-                        try:
-                            code = child.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            child.kill()
-                            code = child.wait(timeout=2)
+                        code, lifecycle = monitor_cli(
+                            child,
+                            output,
+                            cli_executable=Path("/usr/local/bin/claude.real"),
+                            control=Path("/run/relax-control"),
+                            progress=lambda event: print(json.dumps({"ok": True, "progress": event}), flush=True),
+                            max_turns=max_turns,
+                        )
             else:
                 code = execute(
                     argv,
@@ -151,7 +165,7 @@ def run_command(command: dict[str, Any]) -> dict[str, Any]:
                 )
         finally:
             cleanup_descendants()
-        return {"returncode": code}
+        return {"returncode": code, **(lifecycle if operation == "agent" else {})}
     if operation == "verify":
         # The host publishes this directory only after the agent has exited.
         source = Path("/run/relax-verifier")
@@ -183,8 +197,10 @@ def run_command(command: dict[str, Any]) -> dict[str, Any]:
             code = None
         finally:
             cleanup_descendants()
-        if timed_out or not reward_file.is_file():
-            raise RuntimeError("Verifier timed out or produced no reward")
+        if timed_out:
+            raise RuntimeError(f"Verifier timed out after {command['timeout']} seconds")
+        if not reward_file.is_file():
+            raise RuntimeError(f"Verifier produced no reward (exit_code={code})")
         reward = float(reward_file.read_text().strip())
         if not math.isfinite(reward) or reward < 0:
             raise RuntimeError("Verifier infrastructure failure: invalid or negative reward")

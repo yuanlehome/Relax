@@ -81,6 +81,17 @@ def test_oci_service_requires_private_management_token_file(monkeypatch: pytest.
         create_service()
 
 
+def test_gym_turn_limit_default_override_and_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HARBOR_MAX_TURNS", raising=False)
+    assert _agent(monkeypatch).config.max_turns == 200
+    monkeypatch.setenv("HARBOR_MAX_TURNS", "17")
+    assert _agent(monkeypatch).config.max_turns == 17
+    for invalid in ("0", "-1", "none", "1.5"):
+        monkeypatch.setenv("HARBOR_MAX_TURNS", invalid)
+        with pytest.raises(ValueError):
+            create_service()
+
+
 @pytest.mark.asyncio
 async def test_abort_before_slot_prevents_late_container_start(monkeypatch: pytest.MonkeyPatch) -> None:
     agent = _agent(monkeypatch)
@@ -158,6 +169,75 @@ async def test_failed_owned_container_removal_can_retry(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancellation_during_relay_close_preserves_owned_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(monkeypatch)
+    monkeypatch.delenv("CLAUDE_CODE_ARTIFACT_ROOT", raising=False)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Relay:
+        async def aclose(self) -> None:
+            entered.set()
+            await release.wait()
+
+    class Sandbox:
+        stopped = False
+        closed = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    sandbox = Sandbox()
+    agent._sandboxes["close-0"] = sandbox
+    cleanup = agent._ensure_cleanup("close-0", Relay())
+    await entered.wait()
+    waiter = asyncio.create_task(agent.cleanup_rollout("close-0"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+    assert not cleanup.cancelled()
+    assert not (await agent.probe_cleanup("close-0"))["clean"]
+    release.set()
+    await cleanup
+    assert sandbox.stopped and sandbox.closed
+    assert (await agent.probe_cleanup("close-0"))["clean"]
+
+
+@pytest.mark.asyncio
+async def test_image_eviction_timeout_preserves_cache_and_allows_staging_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from examples.claude_code_harbor import oci
+
+    monkeypatch.setenv("CLAUDE_CODE_DOCKER_BINARY", "/synthetic/docker")
+    monkeypatch.setenv("CLAUDE_CODE_DOCKER_HOST", "unix:///synthetic")
+    monkeypatch.setattr(oci.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
+    sandbox = oci.DockerSandbox({})
+    sandbox.cache = oci._ImageCache()
+    sandbox.cache.limit = 0
+    sandbox.image = "synthetic-image"
+    sandbox.cache.references[sandbox.image] = 1
+    calls = []
+
+    async def command(*args: str, **kwargs: Any) -> str:
+        calls.append(args)
+        if args[0] == "image":
+            raise asyncio.TimeoutError
+        return ""
+
+    monkeypatch.setattr(sandbox, "command", command)
+    await sandbox.stop()
+    assert sandbox.stopped and "synthetic-image" in sandbox.cache.unused
+    previous = len(calls)
+    await sandbox.close()
+    assert len(calls) == previous and sandbox.closed and not tmp_path.exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("budget,returncode", [(0.01, -15), (None, 0), (None, 1)])
 async def test_backend_budget_harvests_zero_but_does_not_mask_agent_failure(
     monkeypatch: pytest.MonkeyPatch, budget: float | None, returncode: int
@@ -198,7 +278,9 @@ async def test_backend_budget_harvests_zero_but_does_not_mask_agent_failure(
     context = TaskContext(Sandbox(), Relay(), "synthetic")
     token = _TASK.set(context)
     try:
-        call = HarborClaudeCodeAgent._run_claude_code(None, "synthetic task")
+        call = HarborClaudeCodeAgent._run_claude_code(
+            SimpleNamespace(config=SimpleNamespace(max_turns=200)), "synthetic task"
+        )
         if budget is None and returncode:
             with pytest.raises(RuntimeError, match="no training reward"):
                 await call
@@ -208,6 +290,91 @@ async def test_backend_budget_harvests_zero_but_does_not_mask_agent_failure(
             assert output == ("" if budget else "synthetic output")
         assert context.backend_timed_out is (budget is not None)
         assert events == (["agent_started", "fence", "stop_agent", "drained"] if budget else ["agent_started"])
+    finally:
+        _TASK.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_admission", [False, True])
+async def test_cleanup_permission_retries_expired_lease_but_rejects_late_model_activity(
+    monkeypatch: pytest.MonkeyPatch, late_admission: bool
+) -> None:
+    from examples.claude_code_harbor import nemo_agent
+
+    clock = [100.0]
+    monkeypatch.setattr(nemo_agent, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    finished = asyncio.Event()
+    events = []
+
+    class Sandbox:
+        metadata = {
+            "backend_options": {"model_name": "test", "workdir": "/tmp", "agent_kwargs": {"disallowed_tools": []}},
+            "sandbox_extra_params": {},
+        }
+        agent_progress = [
+            {"phase": "terminal_candidate", "generation": "g", "monotonic": 99.0},
+            {"phase": "cleanup_ready", "generation": "g", "monotonic": 100.0},
+        ]
+
+        async def request(self, *args, **kwargs):
+            if late_admission:
+                await asyncio.sleep(0.3)
+            else:
+                await finished.wait()
+            return {"returncode": 0}
+
+        def permit_tool_cleanup(self, generation, deadline):
+            events.append(("permit", generation, deadline))
+            if sum(event[0] == "permit" for event in events) == 1:
+                clock[0] = deadline + 1.0
+            else:
+                finished.set()
+
+        def revoke_tool_cleanup(self):
+            events.append(("revoke",))
+
+        def read_log(self, path):
+            return "natural exit"
+
+    class Relay:
+        base_url = "http://127.0.0.1"
+        terminal_reason = None
+
+        def model_activity(self, *, quiet_since):
+            assert quiet_since == 99.0
+            return None if late_admission else 7
+
+        def begin_tool_cleanup(self, activity):
+            assert activity == 7
+            events.append(("begin", activity))
+            return clock[0] + 10
+
+        def end_tool_cleanup(self):
+            events.append(("end",))
+
+    context = TaskContext(Sandbox(), Relay(), "synthetic")
+    token = _TASK.set(context)
+    try:
+        assert await asyncio.wait_for(
+            HarborClaudeCodeAgent._run_claude_code(SimpleNamespace(config=SimpleNamespace(max_turns=200)), "task"), 3
+        ) == (
+            "natural exit",
+            "test",
+        )
+        assert not context.backend_timed_out
+        if late_admission:
+            assert events == []
+        else:
+            assert [event[0] for event in events] == [
+                "begin",
+                "permit",
+                "revoke",
+                "end",
+                "begin",
+                "permit",
+                "revoke",
+                "end",
+            ]
     finally:
         _TASK.reset(token)
 
@@ -243,7 +410,7 @@ async def test_backend_timeout_skips_verifier_and_exports_canonical_contexts(mon
         def start(self) -> None:
             pass
 
-        def close(self) -> None:
+        async def aclose(self) -> None:
             events.append("relay_closed")
 
     class Agent:
@@ -256,7 +423,7 @@ async def test_backend_timeout_skips_verifier_and_exports_canonical_contexts(mon
             _TASK.get().backend_timed_out = True
             return SimpleNamespace(model_dump=lambda **kwargs: {})
 
-        async def _ensure_cleanup(self, rollout_id: str) -> None:
+        async def _ensure_cleanup(self, rollout_id: str, relay: Any = None) -> None:
             events.append("cleanup")
 
     monkeypatch.setattr(nemo_agent, "DockerSandbox", Sandbox)

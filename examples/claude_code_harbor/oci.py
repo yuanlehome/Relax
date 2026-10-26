@@ -13,6 +13,7 @@ import shlex
 import shutil
 import stat
 import tempfile
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, ClassVar
@@ -59,6 +60,8 @@ class DockerSandbox:
         self.process: asyncio.subprocess.Process | None = None
         self.stderr: Any = None
         self.closed = False
+        self.stopped = False
+        self.agent_progress: list[dict[str, Any]] = []
 
     async def command(self, *args: str, timeout: float = 120) -> str:
         proc = await asyncio.create_subprocess_exec(
@@ -88,6 +91,7 @@ class DockerSandbox:
         for name in ("control", "assets", "logs", "verifier"):
             (self.root / name).mkdir()
         shutil.copy2(Path(__file__).with_name("sandbox_worker.py"), self.root / "control/worker.py")
+        shutil.copy2(Path(__file__).with_name("cli_lifecycle.py"), self.root / "control/cli_lifecycle.py")
         shutil.copy2(Path(__file__).with_name("claude_settings.json"), self.root / "control/settings.json")
         shutil.copy2(
             Path(__file__).parent / "scripts/install_task_runtime.sh", self.root / "control/install_task_runtime.sh"
@@ -207,13 +211,29 @@ exec "$PYGIT" /run/relax-control/worker.py
 
     async def receive(self, timeout: float | None) -> dict[str, Any]:
         assert self.process is not None and self.process.stdout is not None
-        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
-        if not line:
-            raise RuntimeError("Private OCI controller exited")
-        result = json.loads(line)
-        if result.get("ok") is not True:
-            raise RuntimeError(f"Private OCI controller failed: {result.get('error_type')}: {result.get('error')}")
-        return result
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            line = await asyncio.wait_for(self.process.stdout.readline(), remaining)
+            if not line:
+                raise RuntimeError("Private OCI controller exited")
+            result = json.loads(line)
+            if result.get("ok") is not True:
+                raise RuntimeError(f"Private OCI controller failed: {result.get('error_type')}: {result.get('error')}")
+            if "progress" not in result:
+                return result
+            self.agent_progress.append(result["progress"])
+            with (self.root / "cli-lifecycle.jsonl").open("a") as log:
+                log.write(json.dumps(result["progress"]) + "\n")
+
+    def permit_tool_cleanup(self, generation: str, deadline: float) -> None:
+        path = self.root / "control/tool-cleanup-permit.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"generation": generation, "deadline": deadline}))
+        temporary.replace(path)
+
+    def revoke_tool_cleanup(self) -> None:
+        (self.root / "control/tool-cleanup-permit.json").unlink(missing_ok=True)
 
     async def request(self, operation: str, wait_timeout: float | None, **kwargs: Any) -> dict[str, Any]:
         assert self.process is not None and self.process.stdin is not None
@@ -242,7 +262,7 @@ exec "$PYGIT" /run/relax-control/worker.py
         return await self.request("verify", timeout + 30, timeout=timeout)
 
     async def stop(self) -> None:
-        if self.closed:
+        if self.closed or self.stopped:
             return
         # Removing the owned container kills its complete private PID tree,
         # even when a CC tool escaped its parent's process group.
@@ -262,17 +282,21 @@ exec "$PYGIT" /run/relax-control/worker.py
             while len(self.cache.unused) > self.cache.limit:
                 image, _ = self.cache.unused.popitem(last=False)
                 try:
-                    await self.command("image", "rm", image)
-                except RuntimeError:
+                    await self.command("image", "rm", image, timeout=15)
+                except (RuntimeError, asyncio.TimeoutError):
                     self.cache.unused[image] = None
                     logger.warning("Unused recipe image could not be evicted: %s", image)
                     break
+                except BaseException:
+                    self.cache.unused[image] = None
+                    raise
                 else:
                     self.cache.references.pop(image, None)
+        self.stopped = True
 
     async def close(self) -> None:
         if self.closed:
             return
         await self.stop()
-        shutil.rmtree(self.root)
+        await asyncio.to_thread(shutil.rmtree, self.root)
         self.closed = True

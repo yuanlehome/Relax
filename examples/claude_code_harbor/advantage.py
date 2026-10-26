@@ -4,10 +4,16 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 from typing import Any
 
 from examples.claude_code_harbor.training_data import validate_response_masks
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def advantage_func(metadata_by_session: list[dict[str, dict[str, Any]]]) -> list[dict[str, float]] | None:
@@ -35,6 +41,31 @@ def advantage_func(metadata_by_session: list[dict[str, dict[str, Any]]]) -> list
             raise ValueError("Contexts from one Session must carry the same outcome_reward")
         outcomes.append(values[0])
 
+    # Observe logical outcomes before filtering; never count context fanout as siblings.
+    if os.environ.get("HARBOR_LOG_GROUP_OUTCOMES") == "1":
+        all_zero = all(value == 0 for value in outcomes)
+        all_one = all(value == 1 for value in outcomes)
+        keep = max(outcomes) != min(outcomes)
+        logger.info(
+            "HARBOR_GROUP_OUTCOMES %s",
+            json.dumps(
+                {
+                    "sessions": len(outcomes),
+                    "outcomes": outcomes,
+                    "reward_mean": sum(outcomes) / len(outcomes),
+                    "positive_count": sum(value == 1 for value in outcomes),
+                    "classification": "all_zero"
+                    if all_zero
+                    else "all_one"
+                    if all_one
+                    else "mixed"
+                    if keep
+                    else "constant",
+                    "keep": keep,
+                },
+                sort_keys=True,
+            ),
+        )
     # This is the source dynamic-sampling rule, evaluated before normalization.
     if max(outcomes) == min(outcomes):
         return None

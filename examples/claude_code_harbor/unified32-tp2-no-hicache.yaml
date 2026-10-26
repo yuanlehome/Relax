@@ -1,0 +1,22 @@
+# 64 rollout GPUs: 32 regular TP2 engines, four engines per 8-GPU node.
+# Attention and MoE use TP2. EP1 and DP1 disable expert/attention data parallelism.
+# CPU HiCache remains disabled; GPU radix cache stays enabled.
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+      - worker_type: regular
+        num_gpus: 64
+        overrides:
+          dp_size: 1
+          enable_dp_attention: false
+          enable_dp_lm_head: false
+          ep_size: 1
+          moe_dp_size: 1
+          moe_a2a_backend: none
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          chunked_prefill_size: 8192
+          max_mamba_cache_size: 384
+          page_size: 64
+          enable_hierarchical_cache: false

@@ -149,7 +149,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Any]) -> Any:
             if any(mask[cursor:]):
                 raise ValueError("Response mask contains tokens outside the committed turn trace")
             copies[id(sample)].loss_mask = copied_mask
-            if sample.metadata.get("termination_reason") == "backend_timeout":
+            if sample.metadata.get("termination_reason") in {"backend_timeout", "max_turns"}:
                 copies[id(sample)].status = type(sample).Status.TRUNCATED
 
     get_logger(__name__).info(

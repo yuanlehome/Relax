@@ -32,6 +32,9 @@ def create_service() -> FastAPI:
     host = os.environ["GYM_HOST"]
     port = int(os.environ["GYM_PORT"])
     concurrency = int(os.environ.get("GYM_CONCURRENCY", "512"))
+    max_turns = int(os.environ.get("HARBOR_MAX_TURNS", "200"))
+    if max_turns <= 0:
+        raise ValueError("HARBOR_MAX_TURNS must be a positive integer")
     auth_headers = gateway_auth_headers(os.environ["NEMO_GYM_TOKEN_FILE"])
     management_token = auth_headers["Authorization"][7:].encode("ascii")
     for name in ("CLAUDE_CODE_DOCKER_BINARY", "CLAUDE_CODE_DOCKER_HOST"):
@@ -51,7 +54,7 @@ def create_service() -> FastAPI:
         model_server={"type": "responses_api_models", "name": "policy_model"},
         model="anthropic/proxy-model",
         concurrency=concurrency,
-        max_turns=None,
+        max_turns=max_turns,
         bare=False,
     )
     agent = HarborClaudeCodeAgent(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import hmac
 import http.client
 import json
@@ -18,12 +19,19 @@ import select
 import socket
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from examples.claude_code_harbor.contexts import ContextCapture
 from examples.claude_code_harbor.request_normalization import normalize_request
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _terminal_sse(response: dict[str, Any]) -> bytes:
@@ -49,6 +57,11 @@ def _terminal_sse(response: dict[str, Any]) -> bytes:
 
 class _ModelRequest:
     def __init__(self) -> None:
+        self.request_id = uuid4().hex
+        self.started = time.monotonic()
+        self.phase = "admission"
+        self.status: int | None = None
+        self.failure_logged = False
         self.future: concurrent.futures.Future[tuple[int, dict[str, Any]]] = concurrent.futures.Future()
         self.cancelled = threading.Event()
         self._socket: socket.socket | None = None
@@ -98,10 +111,16 @@ class LocalModelRelay:
             raise ValueError("A positive model request budget is required")
         self._max_requests = max_requests
         self._request_count = 0
+        self._activity_serial = 0
+        self._last_activity = 0.0
+        self._tool_cleanup_until = 0.0
         self.terminal_reason: str | None = None
         self._tasks: set[_ModelRequest] = set()
         self._lock = threading.Lock()
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._shutdown_complete = False
+        self._close_task: asyncio.Task[None] | None = None
         self._harvesting = False
         self._harvest_tasks: list[_ModelRequest] = []
         relay = self
@@ -148,6 +167,10 @@ class LocalModelRelay:
                         self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n')
                         self.wfile.flush()
                     last_heartbeat = time.monotonic()
+                    # A busy Gym process can assign sockets above FD_SETSIZE;
+                    # poll has no select() fd limit and needs no extra fd.
+                    client_poll = select.poll()
+                    client_poll.register(self.connection, select.POLLIN)
                     while True:
                         try:
                             status, response = task.future.result(timeout=min(0.1, relay._heartbeat_s))
@@ -157,9 +180,15 @@ class LocalModelRelay:
                                 raise
                             if task.cancelled.is_set():
                                 raise ConnectionResetError("Model request cancelled")
-                            readable, _, _ = select.select([self.connection], [], [], 0)
-                            if readable and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
-                                raise ConnectionResetError("Model client disconnected")
+                            events = client_poll.poll(0)
+                            if events:
+                                if events[0][1] & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                                    raise ConnectionResetError("Model client disconnected")
+                                try:
+                                    if not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                                        raise ConnectionResetError("Model client disconnected")
+                                except BlockingIOError:
+                                    pass
                             if streaming and time.monotonic() - last_heartbeat >= relay._heartbeat_s:
                                 self.wfile.write(b'event: ping\ndata: {"type":"ping"}\n\n')
                                 self.wfile.flush()
@@ -172,9 +201,13 @@ class LocalModelRelay:
                         self.wfile.flush()
                     else:
                         self._json(status, response)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError) as error:
+                    if task is not None and not task.failure_logged:
+                        relay._log_failure(error, task, "client_transport")
                     self.close_connection = True
-                except Exception:
+                except Exception as error:
+                    if task is None or not task.failure_logged:
+                        relay._log_failure(error, task, "client_handler")
                     # Error bodies intentionally exclude exception strings that
                     # could contain a routed URL or Session credential.
                     error = {"type": "error", "error": {"type": "api_error", "message": "Local model relay failed"}}
@@ -219,10 +252,16 @@ class LocalModelRelay:
 
     def _submit(self, payload: dict[str, Any]) -> _ModelRequest:
         task = _ModelRequest()
-        with self._lock:
-            if self._closed or self._harvesting:
-                raise RuntimeError("Relay closed")
-            self._tasks.add(task)
+        while True:
+            with self._lock:
+                if self._closed or self._harvesting:
+                    raise RuntimeError("Relay closed")
+                if time.monotonic() >= self._tool_cleanup_until:
+                    self._tasks.add(task)
+                    self._activity_serial += 1
+                    self._last_activity = time.monotonic()
+                    break
+            time.sleep(0.02)
 
         def run() -> None:
             try:
@@ -230,6 +269,7 @@ class LocalModelRelay:
                     raise RuntimeError("Model request cancelled")
                 task.future.set_result(self._complete(payload, task))
             except Exception as error:
+                self._log_failure(error, task, task.phase)
                 task.future.set_exception(error)
             finally:
                 with self._lock:
@@ -241,7 +281,51 @@ class LocalModelRelay:
         threading.Thread(target=run, name="cc-model", daemon=True).start()
         return task
 
+    def _log_failure(self, error: Exception, task: _ModelRequest | None, phase: str) -> None:
+        # Exception messages, source lines and locals can contain credentials,
+        # routed URLs or model histories. Keep safe stack locations and types.
+        frames = [
+            {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+            for frame in traceback.extract_tb(error.__traceback__)
+        ]
+        diagnostic = {
+            "event": "local_model_relay_failure",
+            "rollout_hash": hashlib.sha256(self._normalization_id.encode()).hexdigest(),
+            "request_id": task.request_id if task else None,
+            "phase": phase,
+            "exception_type": type(error).__name__,
+            "cause_type": type(error.__cause__).__name__ if error.__cause__ else None,
+            "errno": error.errno if isinstance(error, OSError) else None,
+            "elapsed_s": round(time.monotonic() - task.started, 6) if task else None,
+            "upstream_status": task.status if task else None,
+            "cancelled": task.cancelled.is_set() if task else False,
+            "stack": frames,
+        }
+        if task is not None:
+            task.failure_logged = True
+        logger.warning("Relay diagnostic %s", json.dumps(diagnostic, sort_keys=True))
+
+    def model_activity(self, *, quiet_since: float | None = None) -> int | None:
+        with self._lock:
+            if quiet_since is not None and self._last_activity > quiet_since:
+                return None
+            return self._activity_serial
+
+    def begin_tool_cleanup(self, expected_activity: int, lease_s: float = 10) -> float | None:
+        """Atomically hold new admissions after all accepted calls
+        completed."""
+        with self._lock:
+            if self._closed or self._harvesting or self._tasks or self._activity_serial != expected_activity:
+                return None
+            self._tool_cleanup_until = time.monotonic() + lease_s
+            return self._tool_cleanup_until
+
+    def end_tool_cleanup(self) -> None:
+        with self._lock:
+            self._tool_cleanup_until = 0.0
+
     def _complete(self, payload: dict[str, Any], task: _ModelRequest) -> tuple[int, dict[str, Any]]:
+        task.phase = "normalize_request"
         payload = normalize_request(payload, self._normalization_id)
         with self._lock:
             if self.terminal_reason is not None or self._request_count >= self._max_requests:
@@ -256,24 +340,32 @@ class LocalModelRelay:
         connection = cls(upstream.hostname, upstream.port, timeout=10)
         active_socket: socket.socket | None = None
         try:
+            task.phase = "connect"
             connection.connect()
             active_socket = connection.sock
             assert active_socket is not None
             active_socket.settimeout(None)
             task.bind(active_socket)
+            task.phase = "send_request"
             connection.request(
                 "POST",
                 upstream.path,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 headers={"Authorization": f"Bearer {self._session_id}", "Content-Type": "application/json"},
             )
+            task.phase = "response_headers"
             result = connection.getresponse()
-            response = json.loads(result.read())
+            task.status = result.status
+            task.phase = "response_body"
+            raw = result.read()
+            task.phase = "decode_json"
+            response = json.loads(raw)
             if not isinstance(response, dict):
                 raise ValueError("Upstream response must be an object")
             if result.status == 200:
                 if task.cancelled.is_set():
                     raise RuntimeError("Model request cancelled")
+                task.phase = "capture_context"
                 self.capture.record(payload, response)
             elif result.status == 400:
                 error = response.get("error", {})
@@ -285,6 +377,8 @@ class LocalModelRelay:
                 ):
                     with self._lock:
                         self.terminal_reason = "context_overflow"
+            if result.status >= 500:
+                self._log_failure(RuntimeError(), task, "upstream_http_error")
             return result.status, response
         finally:
             if active_socket is not None:
@@ -316,14 +410,24 @@ class LocalModelRelay:
                 raise RuntimeError("Accepted model call failed during timeout harvest")
         self.capture.seal()
 
+    async def aclose(self) -> None:
+        """Share an owned shutdown operation without blocking the Gym loop."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(asyncio.to_thread(self.close))
+        await asyncio.shield(self._close_task)
+
     def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            active = list(self._tasks)
-        for pending in active:
-            pending.cancel()
-        self.capture.seal()
-        if self._thread.is_alive():
-            self._server.shutdown()
-            self._thread.join(timeout=2)
-        self._server.server_close()
+        with self._close_lock:
+            if self._shutdown_complete:
+                return
+            with self._lock:
+                self._closed = True
+                active = list(self._tasks)
+            for pending in active:
+                pending.cancel()
+            self.capture.seal()
+            if self._thread.is_alive():
+                self._server.shutdown()
+                self._thread.join(timeout=2)
+            self._server.server_close()
+            self._shutdown_complete = True

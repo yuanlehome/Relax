@@ -28,6 +28,63 @@ pytest.importorskip("torch")
 pytest.importorskip("ray")
 
 
+@pytest.mark.asyncio
+async def test_concurrent_shutdown_keeps_event_loop_responsive_and_shares_cancelled_waiter() -> None:
+    relays = [LocalModelRelay("http://127.0.0.1:1", "synthetic") for _ in range(32)]
+    for relay in relays:
+        relay.start()
+    ticks: list[float] = []
+
+    async def ticker() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    clock = asyncio.create_task(ticker())
+    first = asyncio.create_task(relays[0].aclose())
+    second = asyncio.create_task(relays[0].aclose())
+    await asyncio.sleep(0.02)
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    await asyncio.gather(second, *(relay.aclose() for relay in relays[1:]))
+    await asyncio.sleep(0.02)
+    clock.cancel()
+    await asyncio.gather(clock, return_exceptions=True)
+    assert len(ticks) >= 5
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.15
+    assert all(not relay._thread.is_alive() and relay._shutdown_complete for relay in relays)
+    assert relays[0]._close_task is not None and not relays[0]._close_task.cancelled()
+
+
+def test_relay_502_records_safe_underlying_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.claude_code_harbor import relay as module
+
+    logs: list[str] = []
+    monkeypatch.setattr(module.logger, "warning", lambda message, *args: logs.append(message % args))
+    secret = "fake-token-and-private-request-history"
+    relay = LocalModelRelay("http://127.0.0.1:1/private-route", "session", normalization_id="rollout-0")
+
+    def fail(payload: dict[str, Any], task: Any) -> Any:
+        task.phase = "decode_json"
+        raise ValueError("https://secret.invalid/" + secret)
+
+    monkeypatch.setattr(relay, "_complete", fail)
+    relay.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            send(relay)
+        assert caught.value.code == 502
+        body = caught.value.read().decode()
+        assert "Local model relay failed" in body
+        assert len(logs) == 1
+        assert '"exception_type": "ValueError"' in logs[0]
+        assert '"phase": "decode_json"' in logs[0]
+        assert '"stack": [' in logs[0]
+        assert all(value not in logs[0] + body for value in (secret, "secret.invalid", "private-route"))
+    finally:
+        relay.close()
+
+
 @pytest.fixture
 def upstream() -> Iterator[dict[str, Any]]:
     state: dict[str, Any] = {"calls": [], "delay": 0, "status": 200, "started": threading.Event()}
@@ -111,6 +168,49 @@ def send(
         return response.read()
 
 
+def _use_high_fd_accept(relay: LocalModelRelay, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    fcntl = pytest.importorskip("fcntl")
+    resource = pytest.importorskip("resource")
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1100:
+        pytest.skip("The descriptor limit cannot accommodate the high-fd regression socket")
+    original = relay._server.get_request
+    accepted: list[int] = []
+
+    def get_request() -> tuple[socket.socket, Any]:
+        connection, address = original()
+        try:
+            fd = fcntl.fcntl(connection.fileno(), fcntl.F_DUPFD_CLOEXEC, 1100)
+            replacement = socket.socket(fileno=fd)
+        finally:
+            connection.close()
+        accepted.append(replacement.fileno())
+        return replacement, address
+
+    monkeypatch.setattr(relay._server, "get_request", get_request)
+    return accepted
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_local_relay_high_fd_round_trip(
+    upstream: dict[str, Any], monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    upstream["delay"] = 0.3
+    relay = LocalModelRelay(upstream["base_url"], "session", heartbeat_s=0.02)
+    accepted = _use_high_fd_accept(relay, monkeypatch)
+    relay.start()
+    try:
+        result = send(relay, stream=stream).decode()
+        assert accepted and min(accepted) >= 1100
+        if stream:
+            assert result.count("event: ping") >= 2
+            assert "event: message_stop" in result and "event: error" not in result
+        else:
+            assert json.loads(result)["content"][0]["text"] == "answer"
+        assert relay.capture.export(1)[0]["messages"][-1] == {"role": "assistant", "content": "answer"}
+    finally:
+        relay.close()
+
+
 def test_local_relay_preserves_prefix_and_injects_bearer_credential(upstream: dict[str, Any]) -> None:
     relay = LocalModelRelay(upstream["base_url"], "session")
     relay.start()
@@ -122,6 +222,46 @@ def test_local_relay_preserves_prefix_and_injects_bearer_credential(upstream: di
         assert payload["stream"] is False
         assert result["content"][0]["text"] == "answer"
         assert relay.capture.export(1)[0]["messages"][-1] == {"role": "assistant", "content": "answer"}
+    finally:
+        relay.close()
+
+
+def test_tool_cleanup_gate_waits_for_accepted_calls_and_resumes_without_sealing(upstream):
+    relay = LocalModelRelay(upstream["base_url"], "session")
+    relay.start()
+    upstream["release"] = threading.Event()
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            first = pool.submit(send, relay)
+            assert upstream["started"].wait(2)
+            assert relay.begin_tool_cleanup(relay.model_activity()) is None
+            upstream["release"].set()
+            first.result(timeout=2)
+            deadline = time.monotonic() + 1
+            lease = None
+            while lease is None and time.monotonic() < deadline:
+                lease = relay.begin_tool_cleanup(relay.model_activity())
+                time.sleep(0.01)
+            assert lease is not None
+            second = pool.submit(send, relay)
+            time.sleep(0.15)
+            assert not second.done() and len(upstream["calls"]) == 1
+            relay.end_tool_cleanup()
+            second.result(timeout=2)
+            assert len(upstream["calls"]) == 2 and not relay._harvesting
+            assert relay.begin_tool_cleanup(0) is None
+    finally:
+        relay.end_tool_cleanup()
+        relay.close()
+
+
+def test_tool_cleanup_lease_expires_if_controller_disappears(upstream):
+    relay = LocalModelRelay(upstream["base_url"], "session")
+    relay.start()
+    try:
+        assert relay.begin_tool_cleanup(0, lease_s=0.1) is not None
+        assert json.loads(send(relay))["content"][0]["text"] == "answer"
+        assert len(upstream["calls"]) == 1
     finally:
         relay.close()
 
@@ -295,9 +435,14 @@ def test_local_relay_close_does_not_wait_for_blocked_connect(
             relay.close()
 
 
-def test_local_relay_client_disconnect_cancels_held_upstream(upstream: dict[str, Any]) -> None:
+@pytest.mark.parametrize("high_fd", [False, True], ids=["ordinary_fd", "high_fd"])
+def test_local_relay_client_disconnect_cancels_held_upstream(
+    upstream: dict[str, Any], monkeypatch: pytest.MonkeyPatch, high_fd: bool
+) -> None:
     upstream["disconnected"] = threading.Event()
     relay = LocalModelRelay(upstream["base_url"], "session")
+    if high_fd:
+        _use_high_fd_accept(relay, monkeypatch)
     relay.start()
     parsed = urlsplit(relay.base_url)
     client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
@@ -313,6 +458,8 @@ def test_local_relay_client_disconnect_cancels_held_upstream(upstream: dict[str,
         # Drain the initial SSE frame before closing, then prove that the
         # independent upstream TCP connection also closes while still held.
         client.recv(4096)
+        if high_fd:
+            assert not upstream["disconnected"].wait(timeout=0.2)
         client.shutdown(socket.SHUT_RDWR)
         client.close()
         assert upstream["disconnected"].wait(timeout=2)
@@ -324,13 +471,16 @@ def test_local_relay_client_disconnect_cancels_held_upstream(upstream: dict[str,
 
 
 @pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.parametrize("high_fd", [False, True], ids=["ordinary_fd", "high_fd"])
 @pytest.mark.asyncio
 async def test_budget_harvest_retains_accepted_call_after_cli_disconnect(
-    upstream: dict[str, Any], status: int
+    upstream: dict[str, Any], status: int, monkeypatch: pytest.MonkeyPatch, high_fd: bool
 ) -> None:
     upstream["release"] = threading.Event()
     upstream["status"] = status
     relay = LocalModelRelay(upstream["base_url"], "session")
+    if high_fd:
+        _use_high_fd_accept(relay, monkeypatch)
     relay.start()
     parsed = urlsplit(relay.base_url)
     client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)

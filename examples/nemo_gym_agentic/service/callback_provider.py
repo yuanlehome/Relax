@@ -151,6 +151,16 @@ class CallbackProvider:
             except httpx.RequestError as exc:
                 # Delivery is ambiguous after a transport failure. Only retry
                 # explicit server errors, never replay tools or the whole /run.
+                logger.warning(
+                    "NeMo Gym callback transport failure rollout_id=%s resource=%s attempt=%d "
+                    "elapsed_s=%.3f exception_type=%s cause_type=%s",
+                    rollout_id,
+                    resource,
+                    attempt,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                    type(exc.__cause__).__name__ if exc.__cause__ else None,
+                )
                 raise CallbackUpstreamError("Upstream model callback transport failed") from exc
             if not _should_retry(response):
                 break
@@ -195,6 +205,13 @@ class CallbackProvider:
             try:
                 response_payload = response.json()
             except ValueError as exc:
+                logger.warning(
+                    "NeMo Gym callback decode failure rollout_id=%s resource=%s status=%d exception_type=%s",
+                    rollout_id,
+                    resource,
+                    response.status_code,
+                    type(exc).__name__,
+                )
                 raise CallbackUpstreamError("Upstream model callback returned a non-JSON response") from exc
             if not isinstance(response_payload, dict):
                 raise CallbackUpstreamError("Upstream model callback response must be a JSON object")
