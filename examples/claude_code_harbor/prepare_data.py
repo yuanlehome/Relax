@@ -12,8 +12,6 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import yaml
-
 
 def materialize(
     source: Path,
@@ -24,7 +22,6 @@ def materialize(
     """Publish Harbor tasks and Relax prompts from the aligned MiMo bundle."""
     asset_root, source, image_map, output = (path.resolve() for path in (asset_root, source, image_map, output))
     mapping = json.loads(image_map.read_text())
-    task_config = yaml.safe_load(Path(__file__).with_name("config.yaml").read_text())["task"]
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
         staging = Path(temporary)
@@ -44,11 +41,8 @@ def materialize(
             (task / "task.toml").write_text(
                 'version = "1.0"\n\n[environment]\n'
                 f"docker_image = {json.dumps(mapping[metadata['sandbox_image']])}\n"
-                f"cpus = {task_config['cpus']}\nmemory_mb = {task_config['memory_mb']}\n"
                 f"workdir = {json.dumps(metadata['backend_options']['workdir'])}\n"
-                f"build_timeout_sec = {task_config['build_timeout_sec']}\n"
-                f"\n[agent]\ntimeout_sec = {task_config['agent_timeout_sec']}\n"
-                f'\n[verifier]\nenvironment_mode = "shared"\ntimeout_sec = {task_config["verifier_timeout_sec"]}\n',
+                '\n[verifier]\nenvironment_mode = "shared"\n',
                 encoding="utf-8",
             )
             return (

@@ -1631,7 +1631,7 @@ class AgenticSessionShard:
         group = self._groups[group_id]
         self._raise_group_error(group)
         if group.dropped:
-            raise RuntimeGroupError(f"cannot lease group that failed during Prepare: {group.group_id}")
+            return
         if not group.first_request_barrier_crossed:
             raise RuntimeGroupError(f"cannot lease group before every first IR exists: {group.group_id}")
         for session in group.sessions:

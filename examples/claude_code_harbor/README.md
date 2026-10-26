@@ -10,7 +10,7 @@
 ├── harbor-materialized/     # 生成的 Harbor task root
 └── claude-code-harbor/
     ├── harbor-wheelhouse-0.24.0/
-    └── claude-code-runtime-2.1.150-srt-0.0.77.tar.gz
+    └── claude-code-runtime-2.1.308-srt-0.0.77.tar.gz
 ```
 
 模型和checkpoint目录必须在所有Ray节点使用相同绝对路径：
@@ -64,16 +64,18 @@ python3 -m venv "${LOCAL_ROOT}/harbor-venv"
 
 ```bash
 export HARBOR_SIF_CACHE_ROOT=/data/temp/wulumeng/claude-code-harbor
-CLAUDE_RUNTIME=/path/to/shared-root/claude-code-harbor/claude-code-runtime-2.1.150-srt-0.0.77.tar.gz
+CLAUDE_RUNTIME=/path/to/shared-root/claude-code-harbor/claude-code-runtime-2.1.308-srt-0.0.77.tar.gz
 
 mkdir -p "${HARBOR_SIF_CACHE_ROOT}"
 tar -xzf "${CLAUDE_RUNTIME}" -C "${HARBOR_SIF_CACHE_ROOT}"
+patch -d "${HARBOR_SIF_CACHE_ROOT}/runtime/usr/local/lib/node_modules/@anthropic-ai/sandbox-runtime" \
+  -p1 < examples/claude_code_harbor/sandbox-runtime-0.0.77-apptainer.patch
 ```
 
 Harbor venv和Claude Code runtime都安装在`/data/temp/wulumeng/claude-code-harbor/`。
 
 无法访问共享目录时，可在每台worker自行安装，或在构建训练镜像时安装Harbor 0.24.0
-（commit `77d2f153`）、Python 3.12.13、Node.js 22.20.0、Claude Code 2.1.150、Sandbox Runtime
+（commit `77d2f153`）、Python 3.12.13、Node.js 22.20.0、Claude Code 2.1.308、Sandbox Runtime
 0.0.77、bubblewrap 0.10.0、ripgrep 14.1.1和socat 1.8.0.0，并保持相同的本地目录布局。
 
 ### Apptainer
@@ -81,6 +83,7 @@ Harbor venv和Claude Code runtime都安装在`/data/temp/wulumeng/claude-code-ha
 ```bash
 apptainer config global --set "systemd cgroups" no
 apptainer config global --set "sessiondir max size" 8192
+apptainer config global --set "mount slave" no
 sysctl -w user.max_user_namespaces=65536
 ```
 

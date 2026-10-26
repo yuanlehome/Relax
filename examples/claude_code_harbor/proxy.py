@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Session-local Anthropic transport for the source Claude Code SRT wrapper.
+"""Session-local Anthropic-to-Chat transport for Claude Code.
 
 The source wrapper requires a loopback model endpoint. This proxy preserves the
 Relax route prefix and credential, captures complete successful contexts, and
@@ -15,11 +15,17 @@ import http.client
 import json
 import select
 import socket
+import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
+
+
+_MODEL = "relax_model"
 
 
 def _tool_arguments(value: Any) -> str:
@@ -42,18 +48,21 @@ def _text_content(value: Any) -> str:
 
 
 def _chat_messages(
-    raw_messages: list[dict[str, Any]], system: list[dict[str, Any]] | None = None
+    raw_messages: list[dict[str, Any]], system: str | list[dict[str, Any]] | None = None
 ) -> list[dict[str, Any]]:
     # shortcut: this MiMo code recipe is text-only; vision tasks need image block projection.
     messages = []
     if system is not None:
-        text = "\n\n".join(block["text"] for block in system)
+        text = system if isinstance(system, str) else "\n\n".join(block["text"] for block in system)
         if text:
             messages.append({"role": "system", "content": text})
 
     for raw in raw_messages:
         role = raw["role"]
         content = raw["content"]
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
         if role == "assistant":
             text_parts, thinking_parts, calls = [], [], []
             for block in content:
@@ -100,30 +109,32 @@ def _chat_messages(
     return messages
 
 
-def canonical_context(request: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+def _chat_request(payload: dict[str, Any], raw_messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     tools = []
-    for tool in request.get("tools") or []:
+    for tool in payload.get("tools") or []:
         function = {"name": tool["name"], "parameters": tool["input_schema"]}
         if tool.get("description") is not None:
             function["description"] = tool["description"]
         tools.append({"type": "function", "function": function})
-    thinking_type = (request.get("thinking") or {}).get("type")
-    return {
-        "messages": [
-            *_chat_messages(request["messages"], request.get("system")),
-            *_chat_messages([{"role": "assistant", "content": response["content"]}]),
-        ],
+    thinking_type = (payload.get("thinking") or {}).get("type")
+    request = {
+        "model": _MODEL,
+        "messages": _chat_messages(
+            payload["messages"] if raw_messages is None else raw_messages,
+            payload.get("system"),
+        ),
         "tools": tools,
         "chat_template_kwargs": (
             {"enable_thinking": thinking_type != "disabled"}
             if thinking_type in {"disabled", "enabled", "adaptive"}
             else {}
         ),
+        "max_tokens": payload["max_tokens"],
+        "stream": False,
     }
-
-
-def _is_prefix(parent: dict[str, Any], child: dict[str, Any]) -> bool:
-    return parent["messages"] == child["messages"][: len(parent["messages"])]
+    if "stop_sequences" in payload:
+        request["stop"] = payload["stop_sequences"]
+    return request
 
 
 class ContextCapture:
@@ -132,19 +143,71 @@ class ContextCapture:
 
     def __init__(self) -> None:
         self._segments: list[dict[str, Any]] = []
+        self._committed_messages: list[dict[str, Any]] | None = None
+        self._source_message_count: int | None = None
+        self._source_context: dict[str, Any] | None = None
         self._lock = threading.Lock()
         self._sealed = False
 
-    def record(self, request: dict[str, Any], response: dict[str, Any]) -> None:
-        context = canonical_context(request, response)
+    def prepare(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, Any], str]:
+        source_message_count = len(payload["messages"])
+        source_request = _chat_request(payload)
+        source_context = {
+            "messages": source_request["messages"],
+            "tools": source_request["tools"],
+            "chat_template_kwargs": source_request["chat_template_kwargs"],
+        }
         with self._lock:
             if self._sealed:
                 raise RuntimeError("Context capture is closed")
-            # shortcut: foreground CC requests are sequential; concurrent calls need lineage capture.
-            if self._segments and _is_prefix(self._segments[-1], context):
+            if self._committed_messages is None or self._source_message_count is None or self._source_context is None:
+                return source_context, source_message_count, source_request, "new"
+
+            raw_messages = payload["messages"]
+            prefix_request = _chat_request(payload, raw_messages[: self._source_message_count])
+            prefix_context = {
+                "messages": prefix_request["messages"],
+                "tools": prefix_request["tools"],
+                "chat_template_kwargs": prefix_request["chat_template_kwargs"],
+            }
+            if prefix_context != self._source_context:
+                return source_context, source_message_count, source_request, "new"
+            last_assistant = max(
+                index
+                for index in range(self._source_message_count, len(raw_messages))
+                if raw_messages[index]["role"] == "assistant"
+            )
+            source_request["messages"] = [
+                *self._committed_messages,
+                *_chat_messages(raw_messages[last_assistant + 1 :]),
+            ]
+            return source_context, source_message_count, source_request, "normal"
+
+    def record(
+        self,
+        source_context: dict[str, Any],
+        source_message_count: int,
+        request: dict[str, Any],
+        response: dict[str, Any],
+        mode: str,
+    ) -> None:
+        assistant = response["choices"][0]["message"]
+        messages = [*request["messages"], assistant]
+        context = {
+            "messages": messages,
+            "tools": request["tools"],
+            "chat_template_kwargs": request["chat_template_kwargs"],
+        }
+        with self._lock:
+            if self._sealed:
+                raise RuntimeError("Context capture is closed")
+            if mode == "normal":
                 self._segments[-1] = context
             else:
                 self._segments.append(context)
+            self._committed_messages = messages
+            self._source_message_count = source_message_count
+            self._source_context = source_context
 
     def seal(self) -> None:
         with self._lock:
@@ -167,19 +230,43 @@ def _terminal_sse(response: dict[str, Any]) -> bytes:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return f"event: {name}\ndata: {data}\n\n"
 
+    choice = response["choices"][0]
+    message = choice["message"]
+    blocks = []
+    if message.get("reasoning_content"):
+        blocks.append(
+            {
+                "type": "thinking",
+                "thinking": message["reasoning_content"],
+                "signature": f"sig_{uuid4().hex}",
+            }
+        )
+    if message.get("content"):
+        blocks.append({"type": "text", "text": message["content"]})
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call["function"]
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": tool_call["id"],
+                "name": function["name"],
+                "input": json.loads(function["arguments"]),
+            }
+        )
+
     usage = response["usage"]
     start = {
-        "id": response["id"],
+        "id": f"msg_{uuid4().hex}",
         "type": "message",
         "role": "assistant",
-        "model": response.get("model"),
+        "model": _MODEL,
         "content": [],
         "stop_reason": None,
         "stop_sequence": None,
-        "usage": {"input_tokens": usage["input_tokens"], "output_tokens": 0},
+        "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": 0},
     }
     frames = [event("message_start", {"type": "message_start", "message": start})]
-    for index, block in enumerate(response["content"]):
+    for index, block in enumerate(blocks):
         kind = block["type"]
         if kind == "text":
             initial = {"type": "text", "text": ""}
@@ -206,17 +293,21 @@ def _terminal_sse(response: dict[str, Any]) -> bytes:
             for delta in deltas
         )
         frames.append(event("content_block_stop", {"type": "content_block_stop", "index": index}))
-    stop_reason = response["stop_reason"]
+    stop_reason = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+    }[choice["finish_reason"]]
     frames.append(
         event(
             "message_delta",
             {
                 "type": "message_delta",
                 "delta": {
-                    "stop_reason": "end_turn" if stop_reason == "stop_sequence" else stop_reason,
+                    "stop_reason": stop_reason,
                     "stop_sequence": None,
                 },
-                "usage": {"output_tokens": usage["output_tokens"]},
+                "usage": {"output_tokens": usage["completion_tokens"]},
             },
         )
     )
@@ -253,7 +344,7 @@ class LocalModelProxy:
     """One owned proxy per Session; close it before the adapter exits."""
 
     def __init__(self, base_url: str, session_id: str) -> None:
-        upstream = urlsplit(base_url.rstrip("/") + "/v1/messages")
+        upstream = urlsplit(base_url.rstrip("/") + "/v1/chat/completions")
         self.capture = ContextCapture()
         self._upstream = upstream
         self._session_id = session_id
@@ -276,7 +367,15 @@ class LocalModelProxy:
                         self._json(401, {"type": "error", "error": {"type": "authentication_error"}})
                         return
                     payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                    payload["stream"] = False
+                    if urlsplit(self.path).path == "/v1/messages/count_tokens":
+                        self._json(
+                            404,
+                            {
+                                "type": "error",
+                                "error": {"type": "not_found_error", "message": "Token counting is unavailable"},
+                            },
+                        )
+                        return
                     task = proxy._submit(payload)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -305,11 +404,24 @@ class LocalModelProxy:
                     if status == 200:
                         self.wfile.write(_terminal_sse(response))
                     else:
-                        self.wfile.write(b"event: error\ndata: " + json.dumps(response).encode() + b"\n\n")
+                        upstream_error = response.get("error") or {}
+                        error = {
+                            "type": "error",
+                            "error": {
+                                "type": upstream_error.get("type", "api_error"),
+                                "message": upstream_error.get("message", "Upstream model request failed"),
+                            },
+                        }
+                        self.wfile.write(b"event: error\ndata: " + json.dumps(error).encode() + b"\n\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
-                except Exception:
+                except Exception as error:
+                    frame = traceback.extract_tb(error.__traceback__)[-1]
+                    sys.stderr.write(
+                        f"Local model proxy failed: {type(error).__name__} at {frame.filename}:{frame.lineno}\n"
+                    )
+                    sys.stderr.flush()
                     # Error bodies intentionally exclude exception strings that
                     # could contain a routed URL or Session credential.
                     error = {"type": "error", "error": {"type": "api_error", "message": "Local model proxy failed"}}
@@ -372,6 +484,7 @@ class LocalModelProxy:
 
     def _complete(self, payload: dict[str, Any], task: _ModelRequest) -> tuple[int, dict[str, Any]]:
         upstream = self._upstream
+        source_context, source_message_count, request, mode = self.capture.prepare(payload)
         connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=10)
         active_socket: socket.socket | None = None
         try:
@@ -382,7 +495,7 @@ class LocalModelProxy:
             connection.request(
                 "POST",
                 upstream.path,
-                body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                body=json.dumps(request, ensure_ascii=False).encode("utf-8"),
                 headers={"Authorization": f"Bearer {self._session_id}", "Content-Type": "application/json"},
             )
             result = connection.getresponse()
@@ -390,7 +503,7 @@ class LocalModelProxy:
             if result.status == 200:
                 if task.cancelled.is_set():
                     raise RuntimeError("Model request cancelled")
-                self.capture.record(payload, response)
+                self.capture.record(source_context, source_message_count, request, response, mode)
             return result.status, response
         finally:
             if active_socket is not None:
