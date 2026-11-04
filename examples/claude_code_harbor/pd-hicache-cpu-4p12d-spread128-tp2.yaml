@@ -1,0 +1,107 @@
+# 32 GPUs on four nodes, each with one TP2 prefill and three TP2 decode engines.
+# Native sequential groups map P ranks to 0/4/8/12; no group crosses a host.
+# HiCache128 is a per-rank decimal-GB host budget shared by KV and Mamba pools.
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+      - worker_type: prefill
+        num_gpus: 2
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: true
+          enable_hierarchical_cache: true
+          hicache_size: 128
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 6
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: false
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+          disaggregation_decode_enable_radix_cache: false
+      - worker_type: prefill
+        num_gpus: 2
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: true
+          enable_hierarchical_cache: true
+          hicache_size: 128
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 6
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: false
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+          disaggregation_decode_enable_radix_cache: false
+      - worker_type: prefill
+        num_gpus: 2
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: true
+          enable_hierarchical_cache: true
+          hicache_size: 128
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 6
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: false
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+          disaggregation_decode_enable_radix_cache: false
+      - worker_type: prefill
+        num_gpus: 2
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: true
+          enable_hierarchical_cache: true
+          hicache_size: 128
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 6
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          max_mamba_cache_size: 384
+          enable_session_radix_cache: false
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+          disaggregation_decode_enable_radix_cache: false

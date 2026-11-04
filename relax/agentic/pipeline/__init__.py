@@ -36,6 +36,8 @@ class SessionGroupProgress:
     takeable_session_ids: Tuple[str, ...]
     interrupted: bool
     protected: bool
+    resource_released_session_ids: Tuple[str, ...] = ()
+    all_first_ir_arrived: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class SessionSpec:
     metadata: dict[str, Any] = field(default_factory=dict)
     input_payload: dict[str, Any] = field(default_factory=dict)
     sampling_params: dict[str, Any] | None = None
+    require_resource_release: bool = False
 
 
 @dataclass

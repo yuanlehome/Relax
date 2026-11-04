@@ -1714,6 +1714,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Prelaunch agent processes for the next rollout step.",
             )
             parser.add_argument(
+                "--agentic-native-replay-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Opt-in shared directory for exact native Agentic generation request/response streams. "
+                    "Uses bounded asynchronous recording with prefix deltas; incomplete streams are marked explicitly."
+                ),
+            )
+            parser.add_argument(
                 "--agentic-session-lifecycle",
                 action="store_true",
                 default=False,
