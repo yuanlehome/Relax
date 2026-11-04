@@ -36,6 +36,7 @@ class SessionGroupProgress:
     takeable_session_ids: Tuple[str, ...]
     interrupted: bool
     protected: bool
+    resource_released_session_ids: Tuple[str, ...] = ()
     all_first_ir_arrived: bool = False
 
 
@@ -73,6 +74,7 @@ class SessionSpec:
     sampling_params: dict[str, Any] | None = None
     observation_stage_id: str | None = None
     observation_started_at: str | None = None
+    require_resource_release: bool = False
 
 
 @dataclass

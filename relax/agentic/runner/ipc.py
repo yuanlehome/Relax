@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -49,6 +50,8 @@ _LAUNCHER_BOOTSTRAP_TIMEOUT_SECONDS = 30.0
 # Wire-format version shared by LauncherClient and the daemon. A mismatch is a
 # hard compatibility break and must be rolled out atomically.
 _LAUNCHER_PROTOCOL_VERSION = 2
+# Keep receipt-aware connections separate from already running v2 daemons.
+_LAUNCHER_IMPLEMENTATION_REVISION = "resource-release-v2"
 # Four-byte network-order length prefix. Changing it makes every existing
 # launcher connection undecodable.
 _LAUNCHER_MESSAGE_SIZE = struct.Struct("!I")
@@ -106,15 +109,38 @@ class _LauncherProcess:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        *,
+        require_resource_release: bool = False,
     ) -> None:
         self._reader = reader
         self._writer = writer
+        self.group_closed: bool | None = None
         self._exit = asyncio.create_task(self._read_exit(), name="launcher-process")
+        self._closed = (
+            asyncio.create_task(self._read_closed(), name="launcher-process-closed")
+            if require_resource_release
+            else None
+        )
 
     async def wait(self) -> int:
         """Wait for the process exit frame."""
 
         return await asyncio.shield(self._exit)
+
+    async def wait_closed(self) -> bool:
+        """Wait for physical descendant cleanup independently of root exit."""
+
+        if self._closed is None:
+            raise LauncherProtocolError("physical cleanup was not requested for this launch")
+        return await asyncio.shield(self._closed)
+
+    async def _read_closed(self) -> bool:
+        await asyncio.shield(self._exit)
+        response = await _read_launcher_message(self._reader)
+        if response.get("op") != "closed" or not isinstance(response.get("group_closed"), bool):
+            raise LauncherProtocolError(f"launcher expected a closed message, got {response!r}")
+        self.group_closed = response["group_closed"]
+        return self.group_closed
 
     async def terminate(self) -> None:
         """Ask the daemon to terminate and join the complete process group."""
@@ -140,6 +166,10 @@ class _LauncherProcess:
         if not self._exit.done():
             self._exit.cancel()
         await asyncio.gather(self._exit, return_exceptions=True)
+        if self._closed is not None:
+            if not self._closed.done():
+                self._closed.cancel()
+            await asyncio.gather(self._closed, return_exceptions=True)
 
     async def _read_exit(self) -> int:
         """Decode the daemon exit frame."""
@@ -191,7 +221,9 @@ class LauncherClient:
                 raise RuntimeError(error)
             if response != {"op": "started"}:
                 raise LauncherProtocolError(f"launcher expected a started message, got {response!r}")
-            return _LauncherProcess(reader, writer)
+            return _LauncherProcess(
+                reader, writer, require_resource_release=env.get("RELAX_REQUIRE_RESOURCE_RELEASE") == "1"
+            )
         except BaseException:
             writer.close()
             try:
@@ -354,7 +386,12 @@ class ManagedAgentProcess:
         launcher: LauncherClient,
         spec: ManagedCommandAppSpec,
         session_input: SessionInput,
+        *,
+        require_resource_release: bool = False,
     ) -> None:
+        self._require_resource_release = require_resource_release
+        self.resource_released = False
+        self._cleanup_task: Optional["asyncio.Task[None]"] = None
         self._launcher = launcher
         self._spec = spec
         self._session_id = session_input.session_id
@@ -380,6 +417,14 @@ class ManagedAgentProcess:
         """Wait for the managed process task."""
 
         await asyncio.shield(self._task)
+
+    async def wait_resource_release(self) -> None:
+        """Join physical cleanup without delaying logical root-exit
+        delivery."""
+
+        await asyncio.shield(asyncio.gather(self._task, return_exceptions=True))
+        if self._cleanup_task is not None:
+            await asyncio.shield(self._cleanup_task)
 
     @property
     def output(self) -> SessionOutput:
@@ -437,6 +482,8 @@ class ManagedAgentProcess:
             if not self._task.done():
                 self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+            if self._require_resource_release:
+                await self.wait_resource_release()
 
     async def _run(self, input_payload: Mapping[str, Any]) -> None:
         """Run one external agent process for its owning Session."""
@@ -455,6 +502,8 @@ class ManagedAgentProcess:
                 encoding="utf-8",
             )
             del input_payload
+            release_path = session_path / "task-resource-release.json"
+            release_nonce = secrets.token_hex(24)
             env = {
                 **os.environ,
                 **{str(key): str(value) for key, value in self._spec.env.items()},
@@ -464,7 +513,17 @@ class ManagedAgentProcess:
                 "RELAX_SESSION_IO_DIR": session_dir,
                 "RELAX_INPUT_JSON": str(input_path),
                 "RELAX_OUTPUT_JSON": str(output_path),
+                "RELAX_REQUIRE_RESOURCE_RELEASE": "1" if self._require_resource_release else "0",
+                # Harbor uses this marker for its internal sandbox cleanup only.
+                "RELAX_MANAGED_TERMINATION_PROFILE": (
+                    "resource_release_v1" if self._require_resource_release else "default"
+                ),
             }
+            if self._require_resource_release:
+                env.update(
+                    RELAX_RESOURCE_RELEASE_PATH=str(release_path),
+                    RELAX_RESOURCE_RELEASE_NONCE=release_nonce,
+                )
             mark_agentic_event(process_events, "managed_prepare_end_at")
             try:
                 mark_agentic_event(process_events, "managed_launch_start_at")
@@ -526,18 +585,68 @@ class ManagedAgentProcess:
                                 raise
                 finally:
                     if self._process is not None:
-                        try:
-                            await self._process.close()
-                        except Exception as error:
-                            logger.warning(
-                                "Agent connection cleanup failed for session_id=%s: %s", self._session_id, error
+                        if self._require_resource_release:
+                            # Preserve the receipt directory and owner connection
+                            # until every descendant has exited.
+                            self._cleanup_task = asyncio.create_task(
+                                self._finish_resource_release(self._process, release_path, release_nonce, log_path),
+                                name=f"managed-agent-cleanup:{self._session_id}",
                             )
-                        finally:
-                            self._process = None
+                        else:
+                            try:
+                                await self._process.close()
+                            except Exception as error:
+                                logger.warning(
+                                    "Agent connection cleanup failed for session_id=%s: %s", self._session_id, error
+                                )
+                            finally:
+                                self._process = None
 
         finally:
             if not launch_attempted:
                 _cleanup_session_dir(Path(session_dir))
+
+    async def _finish_resource_release(
+        self, process: _LauncherProcess, release_path: Path, release_nonce: str, log_path: Path
+    ) -> None:
+        """Verify both the launcher tree closure and the task's release
+        receipt."""
+
+        try:
+            group_closed = await asyncio.wait_for(
+                process.wait_closed(), timeout=_SUPERVISOR_TERMINATION_TIMEOUT_SECONDS
+            )
+            self.resource_released = group_closed and _valid_resource_release(
+                release_path, self._session_id, release_nonce
+            )
+        except asyncio.CancelledError:
+            self.resource_released = False
+            raise
+        except Exception as error:
+            logger.warning("Agent physical cleanup failed for session_id=%s: %s", self._session_id, error)
+        finally:
+            if not self.resource_released:
+                proof = _resource_release_diagnostic(release_path)
+                try:
+                    proof["command_log_tail"] = _redact_cleanup_log(
+                        _read_log_tail(log_path, limit=4096), release_nonce
+                    )
+                except OSError as error:
+                    proof["command_log_tail"] = {"error": type(error).__name__}
+                logger.error(
+                    "Session task resource release unconfirmed session_id=%s group_id=%s group_closed=%r proof=%s",
+                    self._session_id,
+                    self._group_id,
+                    process.group_closed,
+                    json.dumps(proof),
+                )
+            try:
+                await process.close()
+            except Exception as error:
+                logger.warning("Agent connection cleanup failed for session_id=%s: %s", self._session_id, error)
+            finally:
+                if self._process is process:
+                    self._process = None
 
     @best_effort
     async def _persist_observation_log(self, source: Path) -> None:
@@ -581,6 +690,46 @@ def _persist_log_tail(payload: bytes, target: Path) -> None:
     target.write_bytes(payload)
 
 
+def _valid_resource_release(path: Path, session_id: str, nonce: str) -> bool:
+    try:
+        if path.stat().st_size > 4096:
+            return False
+        value = json.loads(path.read_text())
+        return value == {"schema": 1, "session_id": session_id, "nonce": nonce, "status": "released"}
+    except (OSError, ValueError):
+        return False
+
+
+def _resource_release_diagnostic(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, source in (
+        ("receipt", path),
+        ("cleanup", path.with_suffix(".diagnostic.json")),
+        ("supervisor", path.with_suffix(".supervisor.json")),
+    ):
+        try:
+            with source.open() as handle:
+                value = json.loads(handle.read(16384))
+            if name == "receipt":
+                value = {key: value.get(key) for key in ("schema", "session_id", "status")}
+            elif name == "supervisor":
+                value = {key: value.get(key) for key in ("schema", "session_id", "pid", "children_reaped")}
+            result[name] = value
+        except (OSError, ValueError, AttributeError) as error:
+            result[name] = {"error": type(error).__name__}
+    return result
+
+
+def _redact_cleanup_log(text: str, nonce: str) -> str:
+    text = text.replace(nonce, "<redacted>")
+    return re.sub(
+        r"(?i)((?:authorization|[a-z0-9_]*(?:token|secret|password|nonce|api_key))[\"']?\s*[:=]\s*)"
+        r"(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+        r"\1<redacted>",
+        text,
+    )
+
+
 def _read_log_tail(path: Path, limit: int = 8192) -> str:
     """Read bounded managed-agent diagnostics."""
 
@@ -603,13 +752,16 @@ class ManagedAgentLauncher:
         )
         self._launcher = LauncherClient(ensure_local_launcher_daemon())
 
-    def start_agent(self, session_input: SessionInput) -> ManagedAgentProcess:
+    def start_agent(
+        self, session_input: SessionInput, *, require_resource_release: bool = False
+    ) -> ManagedAgentProcess:
         """Create one process whose lifetime is owned by the Session record."""
 
         return ManagedAgentProcess(
             self._launcher,
             self._app,
             session_input,
+            require_resource_release=require_resource_release,
         )
 
 
@@ -636,7 +788,7 @@ def launcher_socket_path() -> str:
     """Return the node-local launcher socket path."""
 
     user = _launcher_token(Envs.USER or Envs.LOGNAME or str(os.getuid()))
-    return f"/tmp/relax-agentic-launcher-{user}-{_launcher_namespace()}.sock"
+    return f"/tmp/relax-agentic-launcher-{user}-{_launcher_namespace()}-{_LAUNCHER_IMPLEMENTATION_REVISION}.sock"
 
 
 def _ping_launcher(socket_path: str) -> None:
@@ -797,6 +949,8 @@ async def _supervise_launcher_process(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     supervisor: _SessionSupervisor,
+    *,
+    require_resource_release: bool = False,
 ) -> bool:
     """Bind process lifetime and orphan cleanup to its owner connection."""
 
@@ -820,6 +974,14 @@ async def _supervise_launcher_process(
         if not request_task.done():
             request_task.cancel()
             await asyncio.gather(request_task, return_exceptions=True)
+        if require_resource_release:
+            # Root exit is already delivered. Physical cleanup has its own frame;
+            # the owner retains its receipt files until it consumes that frame.
+            group_closed = await supervisor.close()
+            try:
+                await _write_launcher_message(writer, {"op": "closed", "group_closed": group_closed})
+            except (BrokenPipeError, ConnectionResetError):
+                return True
         await reader.read()
         return True
     finally:
@@ -870,7 +1032,9 @@ async def _launch_for_client(
     owner_released = False
     try:
         await _write_launcher_message(writer, {"op": "started"})
-        owner_released = await _supervise_launcher_process(reader, writer, supervisor)
+        owner_released = await _supervise_launcher_process(
+            reader, writer, supervisor, require_resource_release=env.get("RELAX_REQUIRE_RESOURCE_RELEASE") == "1"
+        )
     except (BrokenPipeError, ConnectionResetError):
         owner_released = True
     finally:

@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from examples.claude_code_harbor.node_admission import check_node_admission
 from examples.claude_code_harbor.proxy import LocalModelProxy
 
 
@@ -42,10 +43,9 @@ def _trial_config(task: Path, session_dir: Path, base_url: str) -> Any:
     agent = AgentConfig(
         name="claude-code",
         model_name="anthropic/relax_model",
-        model_base_url=base_url,
-        model_api_key_name="ANTHROPIC_AUTH_TOKEN",
         override_timeout_sec=config["task"]["agent_timeout_sec"],
         env={
+            "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_AUTH_TOKEN": session_id,
             "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": os.environ["MAX_OUTPUT_TOKENS"],
@@ -110,17 +110,36 @@ async def _run_trial(config: Any, stop: asyncio.Event) -> Any:
     waiter = asyncio.create_task(stop.wait(), name=f"harbor-stop:{config.trial_name}")
     try:
         done, _ = await asyncio.wait((task, waiter), return_when=asyncio.FIRST_COMPLETED)
-        if waiter in done and not task.done():
-            task.cancel()
-        result = await task
+        if waiter in done:
+            raise asyncio.CancelledError
+        result = await asyncio.shield(task)
         if stop.is_set():
             raise asyncio.CancelledError
         return result
+    except asyncio.CancelledError:
+
+        async def stop_and_join() -> None:
+            # Harbor recovers artifacts before stopping its environment. Start
+            # the owned stop now, so recovery cannot consume the TERM budget.
+            environment_stop = asyncio.create_task(trial.agent_environment.stop(delete=config.environment.delete))
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            _, stopped = await asyncio.gather(task, environment_stop, return_exceptions=True)
+            if isinstance(stopped, BaseException):
+                raise stopped
+
+        cleanup = asyncio.create_task(stop_and_join(), name=f"harbor-cleanup:{config.trial_name}")
+        # Repeated owner cancellation must not detach or cancel the cleanup.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
     finally:
         waiter.cancel()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(waiter, task, return_exceptions=True)
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 async def main_async() -> None:
@@ -132,6 +151,8 @@ async def main_async() -> None:
     task_root = Path(os.environ["HARBOR_TASK_ROOT"]).resolve()
     task = task_root / metadata["task"]
     mode = os.environ["RELAX_ROLLOUT_MODE"]
+
+    check_node_admission(task=metadata["task"])
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -166,6 +187,14 @@ async def main_async() -> None:
         await asyncio.gather(parent_watch, return_exceptions=True)
         proxy.close()
     records = proxy.capture.export(reward)
+    if not records:
+        # A successful empty output would fall back to implicit Session export.
+        # Fail explicitly so Runtime drops and replenishes the complete Group.
+        raise RuntimeError(
+            f"Harbor trial produced no captured model context; task={task.name}, mode={mode}, "
+            f"trial_exception={getattr(info, 'exception_type', None)}, "
+            f"artifacts={session_dir / 'harbor-trials' / 'trial'}"
+        )
     if mode == "eval":
         records = records[-1:]
     records[-1]["reward"] = reward

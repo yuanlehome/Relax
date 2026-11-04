@@ -1,6 +1,6 @@
 claude_code:
   max_turns: 200
-  max_context_tokens: 57344
+  max_context_tokens: 262144
   allowed_tools: Bash,Read,Edit,Write,Glob,Grep,TaskCreate,TaskGet,TaskList,TaskUpdate,Skill
   disallowed_tools: ListAgents,ReportFindings,SendMessage,WebSearch,WebFetch,AskUserQuestion,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,ScheduleWakeup,TaskOutput,TaskStop,mcp__*
   skill_overrides:
@@ -28,6 +28,6 @@ apptainer:
 
 task:
   cpus: 4
-  memory_mb: 32768
+  memory_mb: 16384
   agent_timeout_sec: 864000
   verifier_timeout_sec: 180
