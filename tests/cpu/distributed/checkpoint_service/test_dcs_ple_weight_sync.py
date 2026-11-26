@@ -29,6 +29,7 @@ PLE_NAME = "module.module.decoder.layers.0.per_layer_embedding.ple_embedding.ngr
 
 def _backend(converter, gather, send_hf, send_raw, *, source=True, skip_base=False, control_group=None):
     backend = DeviceDirectBackend.__new__(DeviceDirectBackend)
+    backend.device = torch.device("cpu")
     backend.args = Namespace(update_weight_buffer_size=8)
     backend._is_pp_src_rank = source
     backend._use_bridge = True

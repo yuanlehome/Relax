@@ -2853,6 +2853,19 @@ class AgenticSessionShard:
         except Exception as error:
             raise RuntimeGroupError(f"SGLang permit cancellation failed: {type(error).__name__}: {error}") from error
 
+    async def _release_sglang_request_permit(self, permit_id: str) -> None:
+        # Ray can cancel a remote release despite asyncio.shield. Release is
+        # idempotent by permit_id, so retry with a fresh ObjectRef, not the cancelled one.
+        for attempt in range(3):
+            try:
+                await self._sglang_request_limiter.release_request_permit.remote(permit_id)
+                return
+            except Exception as error:
+                if not _is_ray_task_cancelled(error) or attempt == 2:
+                    raise RuntimeGroupError(
+                        f"SGLang permit release failed: {type(error).__name__}: {error}"
+                    ) from error
+
     async def _release_sglang_request_permit_after_cancel(self, acquire_ref: Any, permit_id: str) -> None:
         """Release a remote permit acquired after runner cancellation."""
 
@@ -2865,7 +2878,7 @@ class AgenticSessionShard:
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if acquired:
             await finish_before_cancellation(
-                self._sglang_request_limiter.release_request_permit.remote(permit_id),
+                self._release_sglang_request_permit(permit_id),
                 "sglang-permit-release-after-cancel",
             )
 
@@ -2935,13 +2948,10 @@ class AgenticSessionShard:
         try:
             yield
         finally:
-            try:
-                await finish_before_cancellation(
-                    self._sglang_request_limiter.release_request_permit.remote(permit_id),
-                    "sglang-permit-release",
-                )
-            except Exception as error:
-                raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
+            await finish_before_cancellation(
+                self._release_sglang_request_permit(permit_id),
+                "sglang-permit-release",
+            )
 
     async def _abort_backend_ir(self, ir: InflightRequest) -> None:
         """Keep one abort owner until the original backend attempt

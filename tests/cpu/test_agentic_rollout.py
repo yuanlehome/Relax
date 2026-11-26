@@ -1724,6 +1724,91 @@ async def test_request_permit_compensation_accepts_ray_cancellation() -> None:
     shard._sglang_request_limiter.release_request_permit.remote.assert_not_awaited()
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("after_cancel", [False, True])
+async def test_request_permit_retries_cancelled_release_without_leaking(wrapped: bool, after_cancel: bool) -> None:
+    coordinator_cls = AdmissionCoordinator.__ray_metadata__.modified_class
+    coordinator = object.__new__(coordinator_cls)
+    coordinator._request_permits = asyncio.BoundedSemaphore(1)
+    coordinator._active_request_permits = set()
+    coordinator._cancelled_request_permits = {}
+    acquire = AsyncMock(side_effect=partial(coordinator_cls.acquire_request_permit, coordinator))
+    shard = _request_permit_shard(acquire)
+    cancelled_once = False
+
+    async def release(permit_id):
+        nonlocal cancelled_once
+        if not cancelled_once:
+            cancelled_once = True
+            raise _ray_task_cancellation(wrapped=wrapped)
+        await coordinator_cls.release_request_permit(coordinator, permit_id)
+
+    shard._sglang_request_limiter.release_request_permit.remote = release
+    if after_cancel:
+        acquire_ref = asyncio.create_task(acquire("permit-1"))
+        await shard._release_sglang_request_permit_after_cancel(acquire_ref, "permit-1")
+    else:
+        async with shard._sglang_request_permit():
+            assert len(coordinator._active_request_permits) == 1
+    assert not coordinator._active_request_permits
+    assert not coordinator._cancelled_request_permits
+    # A following request can use the returned slot, and release was not doubled.
+    await asyncio.wait_for(coordinator._request_permits.acquire(), timeout=1)
+    assert coordinator._request_permits.locked()
+    coordinator._request_permits.release()
+
+
+async def test_request_permit_finishes_retry_before_propagating_local_cancellation() -> None:
+    shard = _request_permit_shard(AsyncMock(return_value=True))
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+    released = asyncio.Event()
+    cancelled_once = False
+
+    async def release(permit_id):
+        nonlocal cancelled_once
+        if not cancelled_once:
+            cancelled_once = True
+            started.set()
+            await proceed.wait()
+            raise _ray_task_cancellation(wrapped=False)
+        released.set()
+
+    shard._sglang_request_limiter.release_request_permit.remote = release
+
+    async def request():
+        async with shard._sglang_request_permit():
+            pass
+
+    task = asyncio.create_task(request())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert released.is_set()
+    finally:
+        proceed.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_request_permit_release_surfaces_unrecoverable_error(cancelled: bool) -> None:
+    shard = _request_permit_shard(AsyncMock(return_value=True))
+    error = _ray_task_cancellation(wrapped=True) if cancelled else ValueError("coordinator failed")
+    release = AsyncMock(side_effect=error)
+    shard._sglang_request_limiter.release_request_permit.remote = release
+
+    with pytest.raises(RuntimeGroupError, match="SGLang permit release failed") as failure:
+        async with shard._sglang_request_permit():
+            pass
+    assert failure.value.__cause__ is error
+    assert release.await_count == (3 if cancelled else 1)
+
+
 async def test_chat_api_maps_ray_task_cancellation_to_disconnect() -> None:
     service = SimpleNamespace()
     shard = SimpleNamespace(chat=SimpleNamespace(remote=AsyncMock(side_effect=_ray_task_cancellation(wrapped=True))))

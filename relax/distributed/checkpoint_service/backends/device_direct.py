@@ -566,136 +566,172 @@ class DeviceDirectBackend(CommBackend):
         raise RuntimeError(f"No free port available in range [{port_min}, {port_max}]")
 
     def init_process_group_for_rollout(self, topology_data: Optional[Dict] = None) -> None:
-        """Initialize PyTorch distributed process group for rollout
-        communication."""
-
-        if self.role_info is None:
-            raise RuntimeError("Role info not set. Cannot initialize process group.")
-        self._is_pp_src_rank = (
-            self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
-        )
-        if self._is_pp_src_rank:
-            pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
-            master_address = ray._private.services.get_node_ip_address()
-            self._group_name = f"slime-pp_{pp_rank}"
-
+        """Agree on healthy recipients before any PP source rebuilds its
+        group."""
+        group = get_gloo_group()
+        # This Gloo group spans the training world in global-rank order, so
+        # its rank IDs are also valid global ``src`` IDs for broadcasts below.
+        training_rank = dist.get_rank(group)
+        state = {"rank": training_rank, "source": False, "pp_rank": None, "reuse": False, "error": None}
+        try:
+            if self.role_info is None:
+                raise RuntimeError("Role info not set. Cannot initialize process group.")
             if topology_data is None:
                 raise RuntimeError("topology_data is required for init_process_group_for_rollout")
-
-            self.rollout_topology = topology_data.get("nodes", {}).get("rollout", {})
-
-            # Fast path: when the rollout topology is unchanged and the engines are
-            # still healthy, reuse the existing proxy actors and NCCL weight-update
-            # group. We skip create/destroy/sleep/reinit entirely, and crucially do
-            # NOT send /destroy_weights_update_group or /init_weights_update_group to
-            # the rollout side either, so both ends keep the same persistent group.
-            new_sig = self._rollout_topology_signature_of(self.rollout_topology)
-            if (
-                self._model_update_groups is not None
-                and new_sig == self._rollout_topology_signature
-                and self.rollout_engines
-                and not self._healthcheck_rollout_engines()
-            ):
-                logger.info("Reusing rollout weight-update group (topology unchanged).")
-                return
-
-            # Rebuild path (first update, topology change, or an unhealthy engine):
-            # drop any stale engines/group before recreating, and invalidate the
-            # signature until the new group is successfully established.
-            if self.rollout_engines:
-                self._cleanup_rollout_engines()
-            self._rollout_topology_signature = None
-
-            self._create_rollout_engines(self.rollout_topology)
-            self._update_rollout_engines()
-
-            if self._model_update_groups is not None:
-                try:
-                    logger.info("Destroying old process group...")
-                    destroy_payload = {"group_name": self._group_name}
-                    futures = self._batch_request("/destroy_weights_update_group", destroy_payload)
-                    dist.destroy_process_group(self._model_update_groups)
-                    ray.get(futures)
-                    self._model_update_groups = None
-                    # Wait for NCCL socket ports to be released by the OS
-                    time.sleep(2.0)
-                except Exception as e:
-                    logger.warning(f"Error destroying old process group: {e}")
-                    self._model_update_groups = None
-
-            default_gpus = self.args.rollout_num_gpus_per_engine
-            cumulative_offset = 1
-            rank_offsets: dict[int, int] = {}
-            for rank, role_info in sorted(self.rollout_topology.items(), key=lambda kv: int(kv[0])):
-                metadata = role_info.get("metadata") if isinstance(role_info, dict) else {}
-                gpus_for_node = (metadata or {}).get("num_gpus_per_engine", default_gpus)
-                rank_offsets[int(rank)] = cumulative_offset
-                cumulative_offset += gpus_for_node
-            world_size = cumulative_offset
-
-            max_retries = 3
-            last_error = None
-            for attempt in range(1, max_retries + 1):
-                master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
-
-                init_payloads = {}
-                for rank, role_info in self.rollout_topology.items():
-                    init_payloads[int(rank)] = {
-                        "master_address": master_address,
-                        "master_port": master_port,
-                        "rank_offset": rank_offsets[int(rank)],
-                        "world_size": world_size,
-                        "group_name": self._group_name,
-                        "backend": self.backend_type,
-                    }
-
-                logger.info(
-                    f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes "
-                    f"(attempt {attempt}/{max_retries}, port={master_port})..."
+            self._is_pp_src_rank = (
+                self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
+            )
+            state["source"] = self._is_pp_src_rank
+            if self._is_pp_src_rank:
+                state["pp_rank"] = self._megatron.mpu.get_pipeline_model_parallel_rank()
+                self._group_name = f"slime-pp_{state['pp_rank']}"
+                self.rollout_topology = dict(topology_data.get("nodes", {}).get("rollout", {}))
+                state["reuse"] = bool(
+                    self._model_update_groups is not None
+                    and self._rollout_topology_signature_of(self.rollout_topology) == self._rollout_topology_signature
+                    and self.rollout_engines
                 )
-                futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
+        except Exception as error:
+            state["error"] = f"{type(error).__name__}: {error}"
 
+        states = [None] * dist.get_world_size(group)
+        dist.all_gather_object(states, state, group=group)
+        errors = [item["error"] for item in states if item["error"] is not None]
+        if errors:
+            raise RuntimeError(f"Rollout weight group preparation failed: {errors}")
+        sources = sorted((item for item in states if item["source"]), key=lambda item: item["pp_rank"])
+        if not sources or len({item["pp_rank"] for item in sources}) != len(sources):
+            raise RuntimeError("Rollout weight sync requires exactly one source for each pipeline stage")
+
+        # Only one source probes shared servers. Every training rank waits for
+        # this decision, so no other PP can block health checks with NCCL init.
+        health_source = sources[0]["rank"]
+        decision = [None]
+        if training_rank == health_source:
+            try:
+                if not state["reuse"]:
+                    self._cleanup_rollout_engines()
+                    self._create_rollout_engines(self.rollout_topology)
+                initial_failed = self._healthcheck_rollout_engines()
+                if initial_failed:
+                    self._update_rollout_engines()
+                if not self.rollout_engines:
+                    raise RuntimeError("No healthy rollout engines available")
+                decision[0] = {
+                    "error": None,
+                    "rebuild": bool(initial_failed) or not all(item["reuse"] for item in sources),
+                    "topology": self.rollout_topology,
+                }
+            except Exception as error:
+                decision[0] = {"error": f"{type(error).__name__}: {error}"}
+        dist.broadcast_object_list(decision, src=health_source, group=group)
+        if decision[0]["error"] is not None:
+            raise RuntimeError(f"Rollout weight group health check failed: {decision[0]['error']}")
+        if not decision[0]["rebuild"]:
+            if self._is_pp_src_rank:
+                logger.info("Reusing rollout weight-update group (topology unchanged).")
+            return
+
+        # SGLang schedulers see each PP's destroy/init in the same order. The
+        # completion/error broadcast also keeps non-source training ranks aligned.
+        for source in sources:
+            outcome = [None]
+            if training_rank == source["rank"]:
                 try:
-                    self._model_update_groups = init_process_group(
-                        backend=self.backend_type,
-                        init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
-                        world_size=world_size,
-                        rank=0,
-                        group_name=self._group_name,
-                        timeout=timedelta(seconds=180),
-                    )
-                    ray.get(futures)
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"Failed to init process group for rollout (attempt {attempt}/{max_retries}, "
-                        f"port={master_port}): {e}",
-                        exc_info=(attempt == max_retries),
-                    )
-                    self._model_update_groups = None
-                    try:
-                        ray.get(futures, timeout=5)
-                    except Exception:
-                        pass
-                    if attempt < max_retries:
-                        time.sleep(5.0 * attempt)
+                    self.rollout_topology = dict(decision[0]["topology"])
+                    self._cleanup_rollout_engines()
+                    self._rollout_topology_signature = None
+                    self._create_rollout_engines(self.rollout_topology)
+                    self._rebuild_rollout_process_group()
+                except Exception as error:
+                    outcome[0] = f"{type(error).__name__}: {error}"
+            dist.broadcast_object_list(outcome, src=source["rank"], group=group)
+            if outcome[0] is not None:
+                raise RuntimeError(f"Rollout weight group PP{source['pp_rank']} rebuild failed: {outcome[0]}")
 
-            if last_error is not None:
-                raise RuntimeError(
-                    f"Failed to init process group for rollout after {max_retries} attempts"
-                ) from last_error
+    def _rebuild_rollout_process_group(self) -> None:
+        """Rebuild one PP source's transport after shared health agreement."""
+        master_address = ray._private.services.get_node_ip_address()
+        if self._model_update_groups is not None:
+            try:
+                logger.info("Destroying old process group...")
+                destroy_payload = {"group_name": self._group_name}
+                futures = self._batch_request("/destroy_weights_update_group", destroy_payload)
+                dist.destroy_process_group(self._model_update_groups)
+                ray.get(futures)
+                self._model_update_groups = None
+                # Wait for NCCL socket ports to be released by the OS
+                time.sleep(2.0)
+            except Exception as e:
+                logger.warning(f"Error destroying old process group: {e}")
+                self._model_update_groups = None
 
-            # Group successfully (re)built — remember the topology it actually
-            # serves so the next update with the same topology takes the reuse
-            # fast path above. Recompute from ``self.rollout_topology`` rather
-            # than the pre-check ``new_sig`` because ``_update_rollout_engines``
-            # may have pruned dead engines from it; storing the stale full
-            # signature would let the fast path reuse a group that is missing a
-            # since-recovered engine (orphaning it).
-            self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
+        default_gpus = self.args.rollout_num_gpus_per_engine
+        cumulative_offset = 1
+        rank_offsets: dict[int, int] = {}
+        for rank, role_info in sorted(self.rollout_topology.items(), key=lambda kv: int(kv[0])):
+            metadata = role_info.get("metadata") if isinstance(role_info, dict) else {}
+            gpus_for_node = (metadata or {}).get("num_gpus_per_engine", default_gpus)
+            rank_offsets[int(rank)] = cumulative_offset
+            cumulative_offset += gpus_for_node
+        world_size = cumulative_offset
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
+
+            init_payloads = {}
+            for rank, role_info in self.rollout_topology.items():
+                init_payloads[int(rank)] = {
+                    "master_address": master_address,
+                    "master_port": master_port,
+                    "rank_offset": rank_offsets[int(rank)],
+                    "world_size": world_size,
+                    "group_name": self._group_name,
+                    "backend": self.backend_type,
+                }
+
+            logger.info(
+                f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes "
+                f"(attempt {attempt}/{max_retries}, port={master_port})..."
+            )
+            futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
+
+            try:
+                self._model_update_groups = init_process_group(
+                    backend=self.backend_type,
+                    init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
+                    world_size=world_size,
+                    rank=0,
+                    group_name=self._group_name,
+                    timeout=timedelta(seconds=180),
+                )
+                ray.get(futures)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Failed to init process group for rollout (attempt {attempt}/{max_retries}, "
+                    f"port={master_port}): {e}",
+                    exc_info=(attempt == max_retries),
+                )
+                self._model_update_groups = None
+                try:
+                    ray.get(futures, timeout=5)
+                except Exception:
+                    pass
+                if attempt < max_retries:
+                    time.sleep(5.0 * attempt)
+
+        if last_error is not None:
+            raise RuntimeError(
+                f"Failed to init process group for rollout after {max_retries} attempts"
+            ) from last_error
+
+        self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -1159,7 +1195,8 @@ class DeviceDirectBackend(CommBackend):
                 del gathered
 
         def send_shard(converted: tuple[str, torch.Tensor]) -> None:
-            converted_named_tensors.append(converted)
+            name, shard = converted
+            converted_named_tensors.append((name, shard.to(self.device)))
             flush_rollout_bucket()
 
         if not actor_fwd_only and not self._lora_skip_rollout_base:
