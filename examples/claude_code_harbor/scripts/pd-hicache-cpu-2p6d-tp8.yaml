@@ -1,0 +1,29 @@
+# 64 rollout GPUs, with two Prefill and six Decode engines.
+# Keep host-memory headroom for model loading and runtime overhead.
+sglang:
+  - name: default
+    num_gpus_per_engine: 8
+    engine_groups:
+      - worker_type: prefill
+        num_gpus: 16
+        overrides:
+          chunked_prefill_size: 32768  # 16384 per Attention DP rank.
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          enable_session_radix_cache: true
+          enable_hierarchical_cache: true
+          hicache_size: 96  # GB of host memory per rank.
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+      - worker_type: decode
+        num_gpus: 48
+        overrides:
+          page_size: 64
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          enable_session_radix_cache: false
+          enable_hierarchical_cache: false
+          disaggregation_decode_enable_radix_cache: false
+          mem_fraction_static: 0.82

@@ -19,3 +19,14 @@ def advantage_func(metadata_by_session: list[dict[str, dict[str, Any]]]) -> Opti
     std = math.sqrt(sum(value * value for value in centered) / len(centered))
     advantages = [value / (std + 1e-6) for value in centered]
     return [{name: advantage for name in exports} for exports, advantage in zip(metadata_by_session, advantages)]
+
+
+def score_centering_advantage(metadata_by_session: list[dict[str, dict[str, Any]]]) -> list[dict[str, float]]:
+    """Center one outcome per logical Session, retaining zero-variance groups
+    for score centering and broadcasting to that Session's exports."""
+    outcomes: list[float] = [next(iter(exports.values()))["outcome_reward"] for exports in metadata_by_session]
+    mean = sum(outcomes) / len(outcomes)
+    return [
+        {name: outcome - mean for name in exports}
+        for exports, outcome in zip(metadata_by_session, outcomes, strict=True)
+    ]
