@@ -24,6 +24,10 @@ sglang:
           mamba_radix_cache_strategy: extra_buffer
           mamba_track_interval: 256
           enable_session_radix_cache: false
-          enable_hierarchical_cache: false
-          disaggregation_decode_enable_radix_cache: false
+          enable_hierarchical_cache: true
+          disaggregation_decode_enable_radix_cache: true
+          hicache_size: 48  # GB of host memory per rank, shared by KV and Mamba.
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
           mem_fraction_static: 0.82

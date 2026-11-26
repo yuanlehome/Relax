@@ -95,11 +95,16 @@ class TransferDomain:
                 "Agentic dynamic global batch size requires partial rollout and over-sampling "
                 "(over_sampling_batch_size > rollout_batch_size), and is incompatible with fully-async mode."
             )
-        self._transfer_batch_group_count = (
-            args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
-            if args.fully_async
-            else args.rollout_batch_size
-        )
+        if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
+            # The training iterator owns the update quota. Publish each complete
+            # Group as soon as it is ready instead of waiting for that quota.
+            self._transfer_batch_group_count = 1
+        else:
+            self._transfer_batch_group_count = (
+                args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
+                if args.fully_async
+                else args.rollout_batch_size
+            )
         self._fully_async = args.fully_async
         self._previous_partition: Optional[_Partition] = None
         self._current_partition: Optional[_Partition] = None

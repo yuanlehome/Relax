@@ -355,6 +355,8 @@ ______________________________________________________________________
 
 在 fully-async 下，这一过程是**流式**的——Actor 边训练边从 TransferQueue 按需拉取下一个 micro-batch，无需等整批 rollout 数据就绪。
 
+Agentic 在每个完整 Group 完成奖励处理后即可写入 TransferQueue；Advantages 服务按每组的逻辑样本数增量取数，并保留同一 Session 的全部训练行。这两个阶段都不再等待整个 GBS。`global_batch_size` 和 `num_iters_per_train_update` 仍决定训练更新窗口与梯度累积；分区只有达到目标组数才发送 EOS。首个 micro-batch 仍需满足训练所需字段和 DP 分配条件。
+
 ```bash
 --use-dynamic-batch-size       # 启用动态 batch size
 --max-tokens-per-gpu 20480     # 每张 GPU 每个 micro-batch 的 token 预算

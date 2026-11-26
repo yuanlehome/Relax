@@ -272,7 +272,7 @@ SGLANG_ARGS=(
     --sglang-radix-eviction-policy priority
     --sglang-router-policy consistent_hashing
     --sglang-router-prefill-policy consistent_hashing
-    --sglang-router-decode-policy round_robin
+    --sglang-router-decode-policy consistent_hashing
     --sglang-router-health-check-timeout-secs 360
 )
 

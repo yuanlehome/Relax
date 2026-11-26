@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import ray
+from prometheus_client.parser import text_string_to_metric_families
 
 from relax.agentic.session.admission import AdmissionAction, AdmissionReason, BudgetState, GrantResult, WorkerSnapshot
 from relax.utils.http_utils import router_worker_base_urls
@@ -28,7 +29,7 @@ _KV_GAUGE_NAMES = (
     "sglang:token_usage",
     "sglang:full_token_usage",
 )
-_PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(.+)$")
+_PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{|\s)")
 
 
 @dataclass
@@ -39,22 +40,25 @@ class _Waiter:
     result: asyncio.Future[dict[str, Any]]
 
 
-def _parse_engine_kv_gauges(text: str) -> dict[str, float]:
-    gauges: dict[str, float] = {}
-    for line in text.split("\n"):
+def _parse_engine_kv_gauges(text: str) -> dict[str | None, dict[str, float]]:
+    """Deduplicate TP replicas within each independent DP token pool."""
+    metric_lines = []
+    for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
         match = _PROM_LINE_RE.match(line)
-        if match is None or match.group(1) not in _KV_GAUGE_NAMES:
-            continue
-        try:
-            value = float(match.group(2))
-        except ValueError:
-            continue
-        name = match.group(1)
-        gauges[name] = max(gauges.get(name, value), value)
-    return gauges
+        if match is not None and match.group(1) in _KV_GAUGE_NAMES:
+            metric_lines.append(line)
+
+    gauges_by_dp: dict[str | None, dict[str, float]] = {}
+    for family in text_string_to_metric_families("\n".join(metric_lines)):
+        for sample in family.samples:
+            # Prefill cache cannot fund leases held throughout decode. This also
+            # handles legacy routers whose worker discovery has no role metadata.
+            if sample.labels.get("engine_type") == "prefill":
+                continue
+            gauges = gauges_by_dp.setdefault(sample.labels.get("dp_rank"), {})
+            gauges[sample.name] = max(gauges.get(sample.name, sample.value), sample.value)
+    return gauges_by_dp
 
 
 def _decision(
@@ -354,7 +358,9 @@ class AdmissionCoordinator:
             response = await self._client.get(f"{base_url}/workers")
             response.raise_for_status()
             raw_urls = [
-                worker["url"] for worker in response.json()["workers"] if worker["url"] and worker["is_healthy"]
+                worker["url"]
+                for worker in response.json()["workers"]
+                if worker["url"] and worker["is_healthy"] and worker.get("worker_type") != "prefill"
             ]
         except Exception:
             response = await self._client.get(f"{base_url}/list_workers")
@@ -363,15 +369,21 @@ class AdmissionCoordinator:
         urls = router_worker_base_urls(raw_urls)
         responses = await asyncio.gather(*(self._client.get(f"{url}/metrics") for url in urls))
         snapshots = []
+        worker_urls = set(raw_urls)
         for url, response in zip(urls, responses, strict=True):
             response.raise_for_status()
-            gauges = _parse_engine_kv_gauges(response.text)
-            capacity = int(gauges.get("sglang:max_total_num_tokens", 0))
-            used = int(gauges.get("sglang:num_used_tokens", 0))
-            usage = gauges.get("sglang:token_usage", gauges.get("sglang:full_token_usage", 0.0))
-            if usage == 0.0 and capacity:
-                usage = used / capacity
-            snapshots.append(WorkerSnapshot(url, capacity, usage, used))
+            for dp_rank, gauges in _parse_engine_kv_gauges(response.text).items():
+                engine_id = url if dp_rank is None else f"{url}@{dp_rank}"
+                # A base URL advertises the whole engine; a DP-qualified URL
+                # advertises only that healthy pool, even if /metrics exposes more.
+                if dp_rank is not None and url not in worker_urls and engine_id not in worker_urls:
+                    continue
+                capacity = int(gauges.get("sglang:max_total_num_tokens", 0))
+                used = int(gauges.get("sglang:num_used_tokens", 0))
+                usage = gauges.get("sglang:token_usage", gauges.get("sglang:full_token_usage", 0.0))
+                if usage == 0.0 and capacity:
+                    usage = used / capacity
+                snapshots.append(WorkerSnapshot(engine_id, capacity, usage, used))
         return snapshots
 
     def _increment(self, key: str, value: float = 1.0) -> None:

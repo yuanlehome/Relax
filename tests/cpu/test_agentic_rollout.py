@@ -774,6 +774,75 @@ def test_transfer_batch_waterline_follows_fully_async_mode() -> None:
         assert transfer._transfer_batch_group_count == expected_group_count
 
 
+
+@pytest.mark.parametrize("fully_async,dynamic", [(True, True), (True, False), (False, True)])
+def test_streaming_transfer_releases_first_complete_group_without_closing_gbs(fully_async, dynamic) -> None:
+    args = _transfer_args(
+        fully_async=fully_async,
+        use_dynamic_batch_size=dynamic,
+        global_batch_size=512,
+        num_iters_per_train_update=1,
+        n_samples_per_prompt=8,
+        rollout_batch_size=64,
+    )
+    transfer = TransferDomain(args=args)
+    transfer.open_partition(0, target_groups=64)
+    group = _group_export("first", row_count=11)
+    transfer.accept(group)
+    batches = transfer.detach_ready_batches()
+    if not (fully_async and dynamic):
+        assert batches == ()
+        return
+    assert batches == ((0, (group,), False),)
+    assert transfer.total_debt == 63
+    assert args.global_batch_size == 512
+    assert args.num_iters_per_train_update == 1
+    assert transfer.detach_ready_batches() == ()
+    for number in range(1, 64):
+        next_group = _group_export(str(number))
+        transfer.accept(next_group)
+        assert transfer.detach_ready_batches() == ((0, (next_group,), number == 63),)
+    assert transfer.total_debt == 0
+
+
+def test_streaming_transfer_backfills_previous_partition_before_current() -> None:
+    transfer = TransferDomain(args=_transfer_args(fully_async=True, use_dynamic_batch_size=True))
+    transfer.open_partition(0, target_groups=2)
+    first = _group_export("first")
+    transfer.accept(first)
+    assert transfer.detach_ready_batches() == ((0, (first,), False),)
+    transfer.open_partition(1, target_groups=1)
+    backfill = _group_export("backfill", row_count=5)
+    transfer.accept(backfill)
+    assert transfer.detach_ready_batches() == ((0, (backfill,), True),)
+    current = _group_export("current")
+    transfer.accept(current)
+    assert transfer.detach_ready_batches() == ((1, (current,), True),)
+
+
+async def test_streaming_eos_waits_for_prior_write_before_entering_transfer(monkeypatch) -> None:
+    pipeline = object.__new__(AgenticResidentPipeline)
+    pipeline._stage_recorder = SimpleNamespace(enabled=False)
+    pipeline._changed = asyncio.Event()
+    entered = []
+    release_first = asyncio.Event()
+    context = _StepContext(rollout_id=0, final_backfill=False)
+
+    async def transfer(context, partition_id, groups, is_last):
+        entered.append((partition_id, is_last))
+        if not is_last:
+            await release_first.wait()
+
+    monkeypatch.setattr(pipeline, "_transfer_and_record", transfer)
+    pipeline._submit_tq_batch(context, (0, (_group_export("first"),), False))
+    await _wait_until(lambda: entered == [(0, False)])
+    pipeline._submit_tq_batch(context, (0, (_group_export("last"),), True))
+    await asyncio.sleep(0)
+    assert entered == [(0, False)]
+    release_first.set()
+    await asyncio.gather(*context.tq_put_tasks)
+    assert entered == [(0, False), (0, True)]
+
 def test_dynamic_global_requires_partial_oversampling() -> None:
     invalid_overrides = (
         {"partial_rollout": False},
@@ -1458,10 +1527,31 @@ def test_parse_engine_kv_gauges_uses_max_across_tp_ranks() -> None:
             'sglang:token_usage{tp_rank="1"} 0.915',
         ]
     )
-    gauges = _parse_engine_kv_gauges(text)
+    gauges = _parse_engine_kv_gauges(text)[None]
     assert gauges["sglang:max_total_num_tokens"] == 262144.0
     assert gauges["sglang:num_used_tokens"] == 239901.0
     assert gauges["sglang:token_usage"] == 0.915
+
+
+def test_parse_engine_kv_gauges_keeps_independent_dp_pools() -> None:
+    text = """\
+sglang:max_total_num_tokens{dp_rank="0",tp_rank="0"} 100
+sglang:max_total_num_tokens{dp_rank="0",tp_rank="1"} 100
+sglang:num_used_tokens{dp_rank="0",tp_rank="0"} 10
+sglang:token_usage{dp_rank="0",tp_rank="0"} 0.1
+sglang:max_total_num_tokens{dp_rank="1",tp_rank="2"} 200
+sglang:max_total_num_tokens{dp_rank="1",tp_rank="3"} 200
+sglang:num_used_tokens{dp_rank="1",tp_rank="2"} 160
+sglang:full_token_usage{dp_rank="1",tp_rank="2"} 0.8
+"""
+    pools = _parse_engine_kv_gauges(text)
+    assert set(pools) == {"0", "1"}
+    assert pools["0"]["sglang:max_total_num_tokens"] == 100
+    assert pools["1"]["sglang:max_total_num_tokens"] == 200
+    assert pools["0"]["sglang:num_used_tokens"] == 10
+    assert pools["1"]["sglang:num_used_tokens"] == 160
+    assert pools["0"]["sglang:token_usage"] == 0.1
+    assert pools["1"]["sglang:full_token_usage"] == 0.8
 
 
 def test_budget_state_usage_window_tracks_peak_and_resets() -> None:
@@ -1491,6 +1581,75 @@ def _admission_coordinator(*, max_wait_s: float = 30.0, capacity: int = 100):
     coordinator._cancelled_tickets = {}
     coordinator._counters = {}
     return coordinator_cls, coordinator
+
+
+@pytest.mark.parametrize("legacy_discovery", [False, True])
+async def test_admission_counts_healthy_decode_dp_pools_without_prefill(legacy_discovery: bool) -> None:
+    _, coordinator = _admission_coordinator()
+    coordinator._router_ip = "router"
+    coordinator._router_port = 3000
+    coordinator._state = BudgetState(headroom=0.9, pressure_threshold=0.92, staleness_s=100.0)
+    # Unequal DP pools make max-vs-sum visible; TP copies must not add capacity.
+    decode_metrics = """\
+sglang:max_total_num_tokens{engine_type="decode",dp_rank="0",tp_rank="0"} 100
+sglang:max_total_num_tokens{engine_type="decode",dp_rank="0",tp_rank="1"} 100
+sglang:num_used_tokens{engine_type="decode",dp_rank="0",tp_rank="0"} 10
+sglang:token_usage{engine_type="decode",dp_rank="0",tp_rank="0"} 0.1
+sglang:max_total_num_tokens{engine_type="decode",dp_rank="1",tp_rank="2"} 200
+sglang:max_total_num_tokens{engine_type="decode",dp_rank="1",tp_rank="3"} 200
+sglang:num_used_tokens{engine_type="decode",dp_rank="1",tp_rank="2"} 160
+sglang:full_token_usage{engine_type="decode",dp_rank="1",tp_rank="2"} 0.8
+sglang:max_total_num_tokens{engine_type="decode",dp_rank="2",tp_rank="4"} 9000
+sglang:token_usage{engine_type="decode",dp_rank="2",tp_rank="4"} 1
+"""
+    # Modern discovery must use role metadata even if metrics omit engine_type.
+    prefill_labels = 'engine_type="prefill",' if legacy_discovery else ""
+    prefill_metrics = (
+        f'sglang:max_total_num_tokens{{{prefill_labels}dp_rank="0"}} 9000\n'
+        f'sglang:token_usage{{{prefill_labels}dp_rank="0"}} 0.99\n'
+    )
+    workers = [
+        {"url": "http://prefill:8000@0", "worker_type": "prefill", "is_healthy": True},
+        {"url": "http://decode:8000@0", "worker_type": "decode", "is_healthy": True},
+        {"url": "http://decode:8000@1", "worker_type": "decode", "is_healthy": True},
+        {"url": "http://decode:8000@2", "worker_type": "decode", "is_healthy": False},
+    ]
+    decode_scrapes = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal decode_scrapes
+        if request.url.path == "/workers":
+            return httpx.Response(404) if legacy_discovery else httpx.Response(200, json={"workers": workers})
+        if request.url.path == "/list_workers":
+            return httpx.Response(200, json={"urls": [w["url"] for w in workers if w["is_healthy"]]})
+        if request.url.host == "decode":
+            decode_scrapes += 1
+            return httpx.Response(200, text=decode_metrics)
+        assert request.url.host == "prefill"
+        return httpx.Response(200, text=prefill_metrics)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        coordinator._client = client
+        await coordinator._reconcile_once()
+        assert decode_scrapes == 1
+        assert coordinator._state.ceiling == 270
+        assert coordinator._state.max_usage == 0.8
+        grant = coordinator._state.reserve(ticket_id="fits-both-decode-pools", tokens=250, now=time.monotonic())
+        assert grant.granted
+        exhausted = coordinator._state.reserve(ticket_id="exceeds-decode-budget", tokens=21, now=time.monotonic())
+        assert exhausted.reason is AdmissionReason.CAPACITY_EXHAUSTED
+
+        # The fullest healthy DP still guards pressure; do not average it away.
+        decode_metrics = decode_metrics.replace("} 0.8", "} 0.95")
+        await coordinator._reconcile_once()
+        pressured = coordinator._state.reserve(ticket_id="hot-decode-pool", tokens=1, now=time.monotonic())
+        assert pressured.reason is AdmissionReason.PRESSURE_GUARD
+
+        # Losing all decode workers must not turn prefill memory into a budget.
+        workers[:] = workers[:1]
+        await coordinator._reconcile_once()
+        degraded = coordinator._state.reserve(ticket_id="no-decode", tokens=1, now=time.monotonic())
+        assert degraded.reason is AdmissionReason.DEGRADED
 
 
 async def test_admission_waits_for_router_before_starting_polling() -> None:

@@ -4404,11 +4404,42 @@ index 4698fc10..214195d3 100644
      @abstractmethod
      def begin_insert(self, params: InsertParams) -> InsertStepResult:
          """Start the (single-flight) insert, running to its first barrier or completion."""
+diff --git a/python/sglang/srt/disaggregation/decode_hicache_mixin.py b/python/sglang/srt/disaggregation/decode_hicache_mixin.py
+index 2ccef12e..9c40b7e4 100644
+--- a/python/sglang/srt/disaggregation/decode_hicache_mixin.py
++++ b/python/sglang/srt/disaggregation/decode_hicache_mixin.py
+@@ -253,7 +253,7 @@
+
+         dr.hicache_restored_kv_indices = torch.cat(
+             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
+-        )
++        )[: pm.restore_token_count]
+         dr.hicache_restored_node = restored_node
+         dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
+             restored_node
+@@ -288,13 +288,10 @@
+             ):
+                 dr.hicache_restore_status = HiCacheRestoreResult.READY
+
+-        # Phase B: queue new load_back ops if the next slot is free.
+-        # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
+-        # if a previous req holds that slot and isn't done, its event won't be signaled.
+-        counter = self.tree_cache.cache_controller.layer_done_counter
+-        if not self.tree_cache.is_load_back_event_done(
+-            (counter.producer_index + 1) % counter.num_counters
+-        ):
++        # Phase B: queue new load_back ops only when all ranks have a free slot.
++        # Ack queues are reaped in lockstep by check_hicache_events; a local
++        # CUDA event must not gate init_load_back/start_loading collectives.
++        if not self.tree_cache.has_free_load_back_slot():
+             return
+         queued = [
+             dr
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index 421a2157..601f994c 100644
+index 421a2157..039f1421 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -92,7 +92,14 @@ from sglang.srt.observability.metrics_collector import (
+@@ -92,7 +92,14 @@
      StorageMetrics,
      StorageMetricsCollector,
  )
@@ -4424,7 +4455,7 @@ index 421a2157..601f994c 100644
  from sglang.srt.session.streaming_session import StreamingSession
  from sglang.srt.utils.common import ceil_align
  
-@@ -163,6 +170,8 @@ class _OngoingPrefetch(NamedTuple):
+@@ -163,6 +170,8 @@
  
  
  class UnifiedRadixCache(BasePrefixCache):
@@ -4433,7 +4464,7 @@ index 421a2157..601f994c 100644
      def __init__(
          self,
          params: CacheInitParams,
-@@ -265,6 +274,7 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -265,6 +274,7 @@
          # HiCache D↔H defaults (overridden by init_hicache)
          self.cache_controller: Optional[HybridCacheController] = None
          self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
@@ -4441,7 +4472,7 @@ index 421a2157..601f994c 100644
          # Owns the storage backend lifecycle; built by init_hicache.
          self._storage_attachment: Optional[StorageAttachment] = None
          self.linker: Optional[UnifiedCacheLinkerWrapper] = None
-@@ -373,6 +383,8 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -373,6 +383,8 @@
      def _reset_full(self) -> None:
          """Full reset: destroy entire tree and all state."""
          self.tree_core.reset()
@@ -4450,7 +4481,7 @@ index 421a2157..601f994c 100644
          self.session_refs.reset()
  
          # Reset Controller.
-@@ -460,6 +472,8 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -460,6 +472,8 @@
              storage_extra_config=storage_extra_config,
              storage_prefetch_threshold=storage_prefetch_threshold,
          )
@@ -4459,7 +4490,7 @@ index 421a2157..601f994c 100644
          # Tag HiCache enablement on the TreeCore.
          if self.cache_controller is not None:
              self.tree_core.set_hicache_enabled()
-@@ -539,7 +553,52 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -539,7 +553,52 @@
              self.cache_controller.register_host_pool_entry(entry)
          self.sidecar_pool_specs.append(spec)
  
@@ -4512,7 +4543,7 @@ index 421a2157..601f994c 100644
          if self.linker is not None:
              self.linker.close()
          if self.host_pool_group is not None:
-@@ -997,6 +1056,7 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -997,6 +1056,7 @@
  
      @rank_consensus(same_params=["req.rid", "inserted"])
      def on_release(self, req: Req, *, inserted: bool) -> None:
@@ -4520,7 +4551,7 @@ index 421a2157..601f994c 100644
          if inserted:
              return
          for comp in self._components_tuple:
-@@ -1004,6 +1064,8 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1004,6 +1064,8 @@
  
      @rank_consensus(same_params=["req.rid", "up_to"])
      def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
@@ -4529,10 +4560,11 @@ index 421a2157..601f994c 100644
          if self.disable:
              for comp in self._components_tuple:
                  comp.cleanup_after_caching_req(req, is_finished=True)
-@@ -1055,6 +1117,30 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1054,6 +1116,30 @@
+         insert_params.key = radix_key
          insert_params.value = values
          result = self.insert(insert_params)
- 
++
 +        if (
 +            deferred_backup is not None
 +            and self.cache_controller is not None
@@ -4556,11 +4588,10 @@ index 421a2157..601f994c 100644
 +                self._apply_cache_actions(
 +                    self.tree_core.finish_deferred_chunked_backup(req.last_node)
 +                )
-+
+
          # Split the leaf at the prompt boundary so eviction can drop the output
          # KV without the prompt. prev_prefix_len keeps the overlapping indices
-         # from being freed as duplicates; skipped after a declined rotation,
-@@ -1290,6 +1376,19 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1290,6 +1376,19 @@
              req.prefix_indices = new_indices
          req.kv.cache_protected_len = len(new_indices)
          req.last_node = new_last_node
@@ -4580,7 +4611,7 @@ index 421a2157..601f994c 100644
          # Carry the receipt so this node's dec releases only what we locked.
          req.lock_receipt = lock_result.to_dec_params()
          # The rematch acquired a new SWA prefix lock.
-@@ -1363,7 +1462,11 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1363,7 +1462,11 @@
      ) -> None:
          # Free per component host-pool slots, consuming each entry as it frees.
          for ct in list(host_frees):
@@ -4593,7 +4624,7 @@ index 421a2157..601f994c 100644
  
      def evict_host(
          self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
-@@ -1572,6 +1675,8 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1572,6 +1675,8 @@
          self.discard_kv_cache_backup(backup)
  
      def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
@@ -4602,7 +4633,7 @@ index 421a2157..601f994c 100644
          self.host_pool_group.free(backup.host_indices)
          self.host_pool_group.release_transfers(backup.pool_transfers)
  
-@@ -1777,6 +1882,18 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1777,6 +1882,18 @@
          # Build the KV + per-component aux transfers.
          kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
          kv_tokens = len(kv_xfer.host_indices)
@@ -4621,7 +4652,7 @@ index 421a2157..601f994c 100644
          sidecar_xfers = self._build_sidecar_transfers(
              CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
          )
-@@ -1956,6 +2073,10 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1956,6 +2073,10 @@
          cache_salt: Optional[str] = None,
      ) -> int:
          """Probe L3 with the request namespace."""
@@ -4632,7 +4663,7 @@ index 421a2157..601f994c 100644
          if (
              not self.enable_storage
              or self.cache_controller is None
-@@ -2000,6 +2121,8 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -2000,6 +2121,8 @@
          cache_salt: Optional[str] = None,
          storage_hit_end: Optional[int] = None,
      ) -> Optional[bool]:
@@ -4641,6 +4672,47 @@ index 421a2157..601f994c 100644
          if not self.enable_storage or self.cache_controller is None:
              return
  
+@@ -3523,25 +3646,26 @@
+         return 0
+
+     def is_load_back_event_done(self, consumer_index: int) -> bool:
+-        """Return True after the local load-back event is complete.
+-
+-        Lets the disagg decode restore state machine
+-        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
+-        controller-level ``layer_done_counter`` event is shared across cache
+-        implementations, while the tree-side bookkeeping runs in
+-        ``loading_check``.
++        """Poll the local event without entering collective bookkeeping.
++
++        Load acks are reaped in lockstep by check_hicache_events. The decode
++        receiver's READY status is reconciled by its KV poll reduction.
+         """
+         if consumer_index < 0 or self.cache_controller is None:
+             return True
+
+-        finish_event = self.cache_controller.layer_done_counter.events[
++        return self.cache_controller.layer_done_counter.events[
+             consumer_index
+-        ].finish_event
+-        if not finish_event.query():
+-            return False
+-
+-        self.loading_check()
+-        return True
++        ].finish_event.query()
++
++    def has_free_load_back_slot(self) -> bool:
++        """Use the rank-consistent ack queue to guard load-back slot reuse."""
++        if self.cache_controller is None:
++            return True
++        return (
++            len(self.cache_controller.ack_load_queue)
++            < self.cache_controller.layer_done_counter.num_counters
++        )
+
+     # ---- Query / Inspection APIs ----
+     # These APIs exist for compatibility with other RadixTree implementations.
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
 index ee2e5d2b..605b896c 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
@@ -11926,9 +11998,10 @@ diff --git a/python/sglang/srt/disaggregation/mori/conn.py b/python/sglang/srt/d
 
  class MoriKVBootstrapServer(CommonKVBootstrapServer):
 diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index ce82ba554af32f9696070d98209a336f3fc760e7..b45172d92cc49ac1decca2550f513cb53d0847f4 100644
 --- a/python/sglang/srt/disaggregation/decode.py
 +++ b/python/sglang/srt/disaggregation/decode.py
-@@ -44,7 +44,12 @@
+@@ -44,7 +44,12 @@ from sglang.srt.disaggregation.checksum import (
      page_indices_for_request,
      state_indices_for_request,
  )
@@ -11942,7 +12015,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
  from sglang.srt.disaggregation.decode_hicache_mixin import (
      DecodeHiCachePreallocMixin,
      DecodeHiCacheTransferMixin,
-@@ -132,6 +137,7 @@
+@@ -132,6 +137,7 @@ logger = logging.getLogger(__name__)
  _is_npu = is_npu()
 
  if TYPE_CHECKING:
@@ -11950,7 +12023,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
      from sglang.srt.managers.schedule_batch import Req
      from sglang.srt.managers.scheduler import Scheduler
 
-@@ -358,6 +364,14 @@
+@@ -358,6 +364,14 @@ class DecodeRequest:
      hicache_load_consumer_index: int = -1
      hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -11965,12 +12038,10 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
      @property
      def seqlen(self) -> int:
          return self.req.seqlen
-@@ -365,6 +379,79 @@
-     @property
-     def priority(self) -> Optional[int]:
+@@ -367,6 +381,79 @@ class DecodeRequest:
          return self.req.priority
-+
-+
+
+
 +def _consensus_tokenizer_aborts(queue, polls, *gloo_groups) -> set[str]:
 +    """Vote only for failed rooms, after every rank has the same terminal poll."""
 +    if KVPoll.Failed not in polls:
@@ -12042,10 +12113,54 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
 +            propagated = getattr(exc, "is_from_another_rank", False)
 +    (logger.debug if propagated else logger.error)(message)
 +    prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-
-
++
++
  class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-@@ -1026,6 +1113,7 @@
+     """
+     Store the requests that are preallocating.
+@@ -949,6 +1036,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         if hasattr(self.kv_manager, "register_buffer_to_engine"):
+             self.kv_manager.register_buffer_to_engine()
+
++    def _ensure_mamba_prealloc_capacity(self, req: Req) -> bool:
++        """Reclaim enough slots for this request before allocating any state."""
++        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
++        if allocator is None:
++            return True
++        # Prefix COW and request allocation share the main state. Reusing a
++        # state or an existing ping-pong buffer must not charge it twice.
++        needed = int(not req.kv.holds_mamba)
++        if (
++            self.req_to_token_pool.enable_mamba_extra_buffer
++            and req.kv.mamba_ping_pong_track_buffer is None
++        ):
++            needed += (
++                1
++                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy
++                else self.req_to_token_pool.mamba_ping_pong_track_buffer_size
++            )
++        available = allocator.schedulable_available_size()
++        if available >= needed:
++            return True
++        if self.tree_cache.supports_mamba():
++            self.tree_cache.evict_for_alloc(
++                EvictParams(num_tokens=0, mamba_num=needed - available)
++            )
++        return allocator.schedulable_available_size() >= needed
++
+     def resume_retracted_reqs(
+         self, rids_to_check: Optional[List[str]] = None
+     ) -> List[Req]:
+@@ -973,6 +1086,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+
+             if self.req_to_token_pool.available_size() <= 0:
+                 break
++            if not self._ensure_mamba_prealloc_capacity(req):
++                break
+
+             full_required, swa_required = self._prealloc_required_tokens(req)
+             if not self._prealloc_reservation_fits(
+@@ -1026,6 +1141,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
          rids_to_check: Optional[List[str]] = None,
          pp_good_rids: Optional[List[str]] = None,
          pp_bad_rids: Optional[List[str]] = None,
@@ -12053,7 +12168,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
      ) -> None:
          if not self.queue:
              return
-@@ -1051,7 +1139,7 @@
+@@ -1051,7 +1167,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                      decode_req.req.bootstrap_room,
                      bootstrap_timeout,
                  )
@@ -12062,7 +12177,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
 
          # Receiver polling observes asynchronous failures while KV allocation
          # is blocked.
-@@ -1067,6 +1155,12 @@
+@@ -1067,6 +1183,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                  [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
              )
 
@@ -12075,7 +12190,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
          for decode_req, poll in zip(self.queue, polls):
              if poll is None:
                  continue
-@@ -1081,22 +1175,11 @@
+@@ -1081,22 +1203,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                  decode_req.waiting_for_input = True
                  decode_req.req.time_stats.set_bootstrap_done_time()
              elif poll == KVPoll.Failed:
@@ -12103,7 +12218,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
                  )
                  if self.scheduler.metrics_reporter.enable_metrics:
                      self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-@@ -1139,7 +1222,7 @@
+@@ -1139,7 +1250,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                  for decode_req in reqs:
                      # kv_receiver may be None from a prior self.queue cleanup
                      if decode_req.kv_receiver is not None:
@@ -12112,7 +12227,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
                  del self._ensure_retry_count[bootstrap_addr]
                  del self._ensure_last_attempt_time[bootstrap_addr]
              else:
-@@ -1260,6 +1343,7 @@
+@@ -1260,6 +1371,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
          rids_to_check: Optional[List[str]] = None,
          pp_good_rids: Optional[List[str]] = None,
          pp_bad_rids: Optional[List[str]] = None,
@@ -12120,7 +12235,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
      ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
          """Pop the preallocated requests from the pending queue (FIFO)."""
          is_pp_mode = self.pp_size > 1
-@@ -1269,7 +1353,9 @@
+@@ -1269,7 +1381,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
              raise ValueError("rids_to_check cannot be used in PP mode")
 
          self._resolve_pending_reqs()
@@ -12131,7 +12246,28 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
          if is_pp_mode:
              rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
-@@ -2640,7 +2726,13 @@
+@@ -1402,18 +1516,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             if self.req_to_token_pool.available_size() <= 0:
+                 break
+
+-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
+-            # draining the mamba pool before the KV pool (would assert "Not
+-            # enough space for mamba cache"). Evict a cached mamba slot from
+-            # the radix tree first (only if it manages mamba states;
+-            # ChunkCache.evict is a no-op), else stop.
+-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
+-                supports_mamba = self.tree_cache.supports_mamba()
+-                if supports_mamba and hasattr(self.tree_cache, "evict"):
+-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+-                if mamba_allocator.available_size() <= 0:
+-                    break
++            if not self._ensure_mamba_prealloc_capacity(decode_req.req):
++                break
+
+             if hisparse_req_budget <= 0:
+                 break
+@@ -2640,7 +2744,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                  return
          release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
 
@@ -12146,7 +12282,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
          if not self.queue:
              return []
 
-@@ -2658,6 +2750,12 @@
+@@ -2658,6 +2768,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
          else:
              polls = self._poll_with_metadata_gate()
 
@@ -12159,7 +12295,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
          transfer_timeout = float(
              os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
          )
-@@ -2672,33 +2770,28 @@
+@@ -2672,33 +2788,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
              if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                  continue
 
@@ -12208,7 +12344,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
                  self.scheduler.output_streamer.stream_output(
                      [decode_req.req],
                      decode_req.req.return_logprob,
-@@ -2794,7 +2887,7 @@
+@@ -2794,7 +2905,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                          decode_req.req.bootstrap_room,
                          transfer_timeout,
                      )
@@ -12217,7 +12353,7 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
              else:
                  raise ValueError(f"Unexpected poll case: {poll}")
 
-@@ -2849,40 +2942,35 @@
+@@ -2849,40 +2960,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
          """Release drained transfers; device destinations may also time out."""
          if not self._deferred_releases:
              return
@@ -12251,11 +12387,10 @@ diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disa
 +            # must not let one rank admit a request while its peers keep polling.
              torch.distributed.all_reduce(
 -                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
--            )
++                release_states, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+             )
 -        host_ready = iter(host_ready.tolist())
 -        now = time.monotonic()
-+                release_states, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
-+            )
          still_held = []
          to_release = []
 -        for decode_req, deadline, idx, required_acks in self._deferred_releases:

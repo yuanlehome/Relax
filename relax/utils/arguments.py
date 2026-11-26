@@ -1666,6 +1666,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--streaming-tq-stall-timeout-s",
+                type=int,
+                default=7200,
+                help=(
+                    "Positive wall-clock timeout in seconds for consecutive empty TransferQueue polls. "
+                    "Applies to streaming training and log-prob consumers; does not change batch or window sizes."
+                ),
+            )
+            parser.add_argument(
                 "--log-probs-max-tokens-per-gpu",
                 type=int,
                 default=None,

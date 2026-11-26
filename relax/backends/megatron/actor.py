@@ -2450,6 +2450,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields=data_fields,
             rollout_id=rollout_id,
             token_budget=token_budget,
+            max_stream_stall_s=getattr(self.args, "streaming_tq_stall_timeout_s", 7200),
             loss_scale=1.0,  # forward-only: __loss_scale__ is unused
             # streaming=True drained predicate; PP=1 here (see _use_streaming_fwd) so
             # all_consumed's PP reduction is harmless.
@@ -3303,6 +3304,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields=data_fields,
                     rollout_id=rollout_id,
                     token_budget=token_budget,
+                    max_stream_stall_s=getattr(self.args, "streaming_tq_stall_timeout_s", 7200),
                     loss_scale=loss_scale,
                     # PP-collective-free PER-WINDOW end-of-stream check: the
                     # streaming PP schedule pulls per-stage at different schedule

@@ -98,11 +98,19 @@ class Advantages(Base):
             if stream_drain
             else self.data_system_client.async_check_consumption_status
         )
+        # Group-wise reward processing already happened upstream. In a stream,
+        # fetch one group's logical identities (including all their physical
+        # rows) so advantages do not reintroduce the optimizer-update barrier.
+        fetch_batch_size = (
+            self.config.n_samples_per_prompt
+            if stream_drain
+            else self.config.global_batch_size // self.config.num_iters_per_train_update
+        )
         while not run_(drain_check("compute_advantages_and_returns", f"train_{step}")):
             batch_meta = run_(
                 self.data_system_client.async_get_meta(
                     data_fields=fields,
-                    batch_size=self.config.global_batch_size // self.config.num_iters_per_train_update,
+                    batch_size=fetch_batch_size,
                     partition_id=f"train_{step}",
                     task_name="compute_advantages_and_returns",
                 )

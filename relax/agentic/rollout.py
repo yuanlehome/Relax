@@ -560,8 +560,13 @@ class AgenticResidentPipeline:
         if self._stage_recorder.enabled:
             context.observed_group_ids.update(group.group_id for group in groups)
         pending_groups = list(groups)
+        # EOS must not overtake an earlier write that is still converting or
+        # recording metadata and has not allocated its rows in TQ yet.
+        prior_put_tasks = tuple(context.tq_put_tasks) if is_last else ()
 
         async def transfer() -> None:
+            if prior_put_tasks:
+                await asyncio.gather(*prior_put_tasks)
             pending_groups.clear()
             await self._transfer_and_record(context, partition_id, groups, is_last)
 

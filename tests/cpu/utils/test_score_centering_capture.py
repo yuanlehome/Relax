@@ -420,9 +420,9 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         args = _args(debug_train_only=True, multimodal_keys=None, use_opd=False)
         sample = _sample()
         data = module.convert_samples_to_train_data(args, [sample])
-        assert data["rollout_topk_token_ids"] == [[1, 2, 2, 3]]
+        assert data["rollout_topk_token_ids"][0].tolist() == [1, 2, 2, 3]
         assert data["rollout_topk_support_complete"][0].tolist() == [False, False]
-        np.testing.assert_allclose(np.reshape(data["rollout_topk_log_probs"], (2, 2)), sample.rollout_topk_log_probs)
+        np.testing.assert_allclose(data["rollout_topk_log_probs"][0].reshape(2, 2).numpy(), sample.rollout_topk_log_probs)
         monkeypatch.setattr(module, "post_process_rewards", lambda args, samples: [[0.3, -0.2]] * len(samples))
         assert module.convert_samples_to_train_data(args, [sample])["rewards"] == [[0.3, -0.2]]
         args.custom_convert_samples_to_train_data_path = "custom.converter"

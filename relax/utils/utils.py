@@ -235,9 +235,13 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         for sample in samples:
             validate_score_centering_sample(sample, args.rollout_top_logprobs_num, vocab_size=sc_vocab_size)
         for field in SCORE_CENTERING_FIELDS:
-            # TQ's numeric nested-list path expects one flat variable-length row
-            # per sample. Restore [R, K] at the training ingestion boundary.
-            train_data[field] = [getattr(sample, field).reshape(-1).tolist() for sample in samples]
+            # Keep candidate arrays on the tensor-list path: materializing
+            # R*K Python scalars per row stalls long agentic rollouts. Preserve
+            # the previous wire dtypes and restore [R, K] at training ingestion.
+            dtype = torch.int64 if field == "rollout_topk_token_ids" else torch.float32
+            train_data[field] = [
+                torch.from_numpy(getattr(sample, field).reshape(-1)).to(dtype=dtype) for sample in samples
+            ]
         train_data["rollout_topk_support_complete"] = [
             torch.from_numpy(sample.rollout_topk_support_complete)
             if sample.rollout_topk_support_complete is not None

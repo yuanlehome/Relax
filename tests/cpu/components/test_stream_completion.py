@@ -42,7 +42,11 @@ def test_advantages_empty_polling_is_bounded_and_ready_data_runs_once(monkeypatc
     monkeypatch.setattr(advantages_module, "run_", run_immediate)
     worker = SimpleNamespace(
         config=Namespace(
-            fully_async=True, use_dynamic_batch_size=True, global_batch_size=1, num_iters_per_train_update=1
+            fully_async=True,
+            use_dynamic_batch_size=True,
+            global_batch_size=1,
+            num_iters_per_train_update=1,
+            n_samples_per_prompt=1,
         ),
         data_system_client=SimpleNamespace(
             async_check_stream_drained=drained, async_get_meta=metadata, async_get_data=get_data, async_put=put
