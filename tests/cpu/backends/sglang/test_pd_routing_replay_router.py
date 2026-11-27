@@ -66,18 +66,22 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "model_path": self.server.model_path,
                 "is_generation": True,
-                "dp_size": 1,
+                "dp_size": getattr(self.server, "dp_size", 1),
                 "tp_size": 1,
-                "enable_dp_attention": False,
+                "enable_dp_attention": getattr(self.server, "dp_size", 1) > 1,
                 "disaggregation_mode": self.server.role,
                 "max_total_num_tokens": 65536,
-                "internal_states": [{}],
+                "internal_states": [{}] * getattr(self.server, "dp_size", 1),
                 "version": "0.5.21",
             }
         )
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        fault = getattr(self.server, "fault", None)
+        if fault is not None and self.path in ("/generate", "/abort_request"):
+            fault.handle(self, request)
+            return
         if self.path != "/generate":
             self.reply({"success": True})
             return
@@ -119,11 +123,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.reply(body)
         self.last_generate_finished = time.monotonic()
+        self.server.response_finished.set()
 
 
 @pytest.fixture
 def router(tmp_path, request):
     regular = getattr(request, "param", None) == "regular"
+    pd_retry = getattr(request, "param", None) == "pd-retry"
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text(
@@ -146,6 +152,8 @@ def router(tmp_path, request):
     for role in ("null", "null") if regular else ("prefill", "decode"):
         worker = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         worker.daemon_threads = True
+        worker.dp_size = 2 if pd_retry else 1
+        worker.response_finished = threading.Event()
         worker.close_connections = regular
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
         worker.response_status, worker.response_gate, worker.disconnect = 200, None, False
@@ -174,6 +182,9 @@ def router(tmp_path, request):
     ]
     if regular:
         worker_args = ["--worker-urls", workers[0].url, workers[1].url, "--cb-failure-threshold", "1"]
+    elif pd_retry:
+        worker_args.remove("--disable-retries")
+        worker_args.extend(["--dp-aware", "--retry-max-retries", "5"])
     command = [
         sys.executable,
         "-m",
@@ -184,7 +195,7 @@ def router(tmp_path, request):
         str(port),
         *worker_args,
         "--policy",
-        "round_robin",
+        "consistent_hashing" if pd_retry else "round_robin",
         "--worker-startup-timeout-secs",
         "8",
         "--worker-startup-check-interval",
@@ -207,7 +218,9 @@ def router(tmp_path, request):
                 try:
                     with urlopen(url + "/workers", timeout=0.2) as request:
                         state = json.load(request)
-                    if len(state.get("workers", [])) == 2 and all(w["is_healthy"] for w in state["workers"]):
+                    if len(state.get("workers", [])) == (4 if pd_retry else 2) and all(
+                        w["is_healthy"] for w in state["workers"]
+                    ):
                         break
                 except (URLError, TimeoutError):
                     pass

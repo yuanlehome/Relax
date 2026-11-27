@@ -96,7 +96,13 @@ sysctl -w user.max_user_namespaces=65536
 
 独立脚本 `scripts/run-qwen38-flash-next-128xgpu-async-muon-sc.sh` 固定使用 64 卡 actor 和 64 卡 rollout；优势计算使用 CPU。rollout 为 TP8 的 2 个 Prefill、6 个 Decode engine，Prefill HiCache 为每 rank 96 GB，为模型加载和主机侧开销保留余量。
 
-`config.yaml` 的 `claude_code.max_context_tokens` 设为 131072，脚本读取该值并统一设置训练 sequence length、rollout 和 SGLang context length。默认每轮 64 个 prompt group、每组 8 个 session，共 512 个逻辑训练样本；SC 保留零方差组。
+`config.yaml` 的 `claude_code.max_context_tokens` 设为 131072，脚本读取该值并统一设置训练 sequence length、rollout 和 SGLang context length。默认每轮 64 个 prompt group、每组 8 个 session，共 512 个逻辑训练样本；SC 拒绝零方差组（全成功或全失败），由现有流水线继续补采，直到凑齐 64 个有效组、512 个逻辑 Session；被拒绝的组不占训练批次名额。混合奖励组只减组内均值，不除以标准差。
+
+默认 `AGENTIC_RUNTIME_GROUPS=80`、`AGENTIC_PREPARE_GROUPS=16`、`AGENTIC_CONCURRENCY=96`。Runtime 只计算已放行且尚未完成的组，Prepare、Reward 和完成缓冲不计入 80 组目标。组完成或受控失败后补位；每个训练 batch 仍收集 64 个完整组、512 个逻辑 Session，未完成组和 FIFO 完成缓冲交给后续 batch。
+
+Runtime、Reward、完成缓冲和在途交付共同使用有界输出预算，默认最多持有 `80 + 64 = 144` 个尚未交付的组；驻留上限仍为 96。普通 batch 边界在 TQ 和 staleness 条件允许时保持生成开启；权重更新、`max_staleness=2`、下游背压和最终收尾仍会限制补位或暂停。最后一个 batch 和 final backfill 只补足训练欠账。未设置 `--agentic-runtime-groups` 的其他 recipe 保持原调度行为。
+
+`agentic/scheduler/` 指标分别记录 Runtime、Prepare、Reward、完成缓冲、TQ 在途组及驻留上限；`refill_blocked/` 区分权重更新、staleness、交付背压、完成缓冲压力和准备未就绪等原因。
 
 在已准备 SGLang、Megatron 和 Muon 的训练 Python 环境中，从仓库根目录运行。模型、数据和 checkpoint 在所有 Ray 节点使用相同的绝对路径；Harbor runtime、venv 和可选 Muon 源码在每台 worker 使用相同的本地路径：
 
@@ -125,7 +131,7 @@ export RELAX_SKIP_CLUSTER_CLEANUP=1
 export EXP_NAME=qwen38-flash-next-cc-harness-harbor-128xgpu-async-muon-sc
 
 NUM_ROLLOUT=2 ROLLOUT_BATCH_SIZE=2 N_SAMPLES=8 \
-OVER_SAMPLING_BATCH_SIZE=3 AGENTIC_CONCURRENCY=4 \
+OVER_SAMPLING_BATCH_SIZE=3 AGENTIC_RUNTIME_GROUPS=3 AGENTIC_PREPARE_GROUPS=1 AGENTIC_CONCURRENCY=4 \
 bash scripts/entrypoint/ray-job.sh \
   examples/claude_code_harbor/scripts/run-qwen38-flash-next-128xgpu-async-muon-sc.sh \
   --save-interval 1

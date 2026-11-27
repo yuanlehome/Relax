@@ -368,6 +368,12 @@ def streaming_forward_backward_pipelining_without_interleaving(
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
+        # The in-flight graph owns the tensors needed for backward.
+        # Do not retain the consumed data dictionary for the rest of the window.
+        warmup_batches[i] = None
+        del batch
+    del warmup_batches
+
     # ── Steady 1F1B ─────────────────────────────────────────────────────────
     # Prefetch the first steady-state mb.  If none, steady phase is empty.
     current_batch = _try_next()

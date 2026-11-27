@@ -774,7 +774,6 @@ def test_transfer_batch_waterline_follows_fully_async_mode() -> None:
         assert transfer._transfer_batch_group_count == expected_group_count
 
 
-
 @pytest.mark.parametrize("fully_async,dynamic", [(True, True), (True, False), (False, True)])
 def test_streaming_transfer_releases_first_complete_group_without_closing_gbs(fully_async, dynamic) -> None:
     args = _transfer_args(
@@ -842,6 +841,7 @@ async def test_streaming_eos_waits_for_prior_write_before_entering_transfer(monk
     release_first.set()
     await asyncio.gather(*context.tq_put_tasks)
     assert entered == [(0, False), (0, True)]
+
 
 def test_dynamic_global_requires_partial_oversampling() -> None:
     invalid_overrides = (

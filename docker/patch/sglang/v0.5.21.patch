@@ -1294,7 +1294,7 @@ index b7d31afa..511e6dea 100644
  
  
 diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
-index 2ee23a97..ce82ba55 100644
+index 2ee23a97..a5c757e8 100644
 --- a/python/sglang/srt/disaggregation/decode.py
 +++ b/python/sglang/srt/disaggregation/decode.py
 @@ -22,6 +22,7 @@ from __future__ import annotations
@@ -1305,7 +1305,126 @@ index 2ee23a97..ce82ba55 100644
  import time
  from collections import deque
  from concurrent.futures import Future
-@@ -940,6 +941,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+@@ -43,7 +44,12 @@ from sglang.srt.disaggregation.checksum import (
+     page_indices_for_request,
+     state_indices_for_request,
+ )
+-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
++from sglang.srt.disaggregation.common.conn import (
++    CommonKVManager,
++    CommonKVReceiver,
++    KVAbortReason,
++    KVTransferError,
++)
+ from sglang.srt.disaggregation.decode_hicache_mixin import (
+     DecodeHiCachePreallocMixin,
+     DecodeHiCacheTransferMixin,
+@@ -131,6 +137,7 @@ logger = logging.getLogger(__name__)
+ _is_npu = is_npu()
+ 
+ if TYPE_CHECKING:
++    from sglang.srt.managers.io_struct import AbortReq
+     from sglang.srt.managers.schedule_batch import Req
+     from sglang.srt.managers.scheduler import Scheduler
+ 
+@@ -357,6 +364,16 @@ class DecodeRequest:
+     hicache_load_consumer_index: int = -1
+     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+ 
++    def abort_kv(self, control: AbortReq) -> None:
++        reason = (
++            KVAbortReason.TOKENIZER
++            if control.is_tokenizer_abort_for(self.req.rid)
++            else control.abort_message or "Scheduler aborted the KV transfer."
++        )
++        if reason is KVAbortReason.TOKENIZER:
++            self.kv_receiver.tokenizer_abort_rid = self.req.rid
++        self.kv_receiver.abort(reason)
++
+     @property
+     def seqlen(self) -> int:
+         return self.req.seqlen
+@@ -366,6 +383,79 @@ class DecodeRequest:
+         return self.req.priority
+ 
+ 
++def _consensus_tokenizer_aborts(queue, polls, *gloo_groups) -> set[str]:
++    """Vote only for failed rooms, after every rank has the same terminal poll."""
++    if KVPoll.Failed not in polls:
++        return set()
++    failed = [item for item, poll in zip(queue, polls) if poll == KVPoll.Failed]
++    votes = []
++    for item in failed:
++        receiver = item.kv_receiver
++        manager = getattr(receiver, "kv_mgr", None)
++        lock = getattr(manager, "failure_lock", None)
++        agreed = False
++        if (
++            lock is not None
++            and item.hicache_restore_status != HiCacheRestoreResult.FAILED
++        ):
++            with lock:
++                agreed = (
++                    manager.failure_records.get(item.req.bootstrap_room)
++                    is KVAbortReason.TOKENIZER
++                )
++        votes.append(agreed)
++    if torch.distributed.is_initialized():
++        for group in gloo_groups:
++            if torch.distributed.get_world_size(group) > 1:
++                ballot = torch.tensor(votes, dtype=torch.uint8, device="cpu")
++                torch.distributed.all_reduce(
++                    ballot, op=torch.distributed.ReduceOp.MIN, group=group
++                )
++                votes = ballot.tolist()
++    return {item.req.rid for item, agreed in zip(failed, votes) if agreed}
++
++
++def _finish_decode_kv_failure(
++    decode_req: DecodeRequest,
++    stage: str,
++    rank: int,
++    kv_failed: bool = True,
++    *,
++    confirmed_abort: bool = True,
++) -> None:
++    req = decode_req.req
++    message = (
++        f"Decode {stage} failed for request rank={rank} decode_req.req.rid={req.rid!r} "
++        f"decode_req.req.bootstrap_room={req.bootstrap_room}"
++    )
++    propagated = False
++    if kv_failed:
++        try:
++            decode_req.kv_receiver.failure_exception()
++        except Exception as exc:
++            if (
++                isinstance(exc, KVTransferError)
++                and exc.bootstrap_room == req.bootstrap_room
++                and exc.failure_reason is KVAbortReason.TOKENIZER
++            ):
++                if decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
++                    message += " during HiCache restore"
++                elif confirmed_abort:
++                    prepare_abort(
++                        req, f"Request {req.rid} was aborted", status_code=499
++                    )
++                    return
++                else:
++                    message += (
++                        " because another rank did not confirm tokenizer cancellation"
++                    )
++            else:
++                message += f" with exception {exc}"
++            propagated = getattr(exc, "is_from_another_rank", False)
++    (logger.debug if propagated else logger.error)(message)
++    prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
++
++
+ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+     """
+     Store the requests that are preallocating.
+@@ -940,6 +1030,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                  get_disagg().disaggregation_decode_retraction_backup,
              )
          self.retracted_queue.clear()
@@ -1313,7 +1432,54 @@ index 2ee23a97..ce82ba55 100644
          if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
              self.kv_manager.deregister_buffer_to_engine()
  
-@@ -1028,6 +1030,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+@@ -947,6 +1038,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         if hasattr(self.kv_manager, "register_buffer_to_engine"):
+             self.kv_manager.register_buffer_to_engine()
+ 
++    def _ensure_mamba_prealloc_capacity(self, req: Req) -> bool:
++        """Reclaim enough slots for this request before allocating any state."""
++        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
++        if allocator is None:
++            return True
++        # Prefix COW and request allocation share the main state. Reusing a
++        # state or an existing ping-pong buffer must not charge it twice.
++        needed = int(not req.kv.holds_mamba)
++        if (
++            self.req_to_token_pool.enable_mamba_extra_buffer
++            and req.kv.mamba_ping_pong_track_buffer is None
++        ):
++            needed += (
++                1
++                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy
++                else self.req_to_token_pool.mamba_ping_pong_track_buffer_size
++            )
++        available = allocator.schedulable_available_size()
++        if available >= needed:
++            return True
++        if self.tree_cache.supports_mamba():
++            self.tree_cache.evict_for_alloc(
++                EvictParams(num_tokens=0, mamba_num=needed - available)
++            )
++        return allocator.schedulable_available_size() >= needed
++
+     def resume_retracted_reqs(
+         self, rids_to_check: Optional[List[str]] = None
+     ) -> List[Req]:
+@@ -971,6 +1088,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+ 
+             if self.req_to_token_pool.available_size() <= 0:
+                 break
++            if not self._ensure_mamba_prealloc_capacity(req):
++                break
+ 
+             full_required, swa_required = self._prealloc_required_tokens(req)
+             if not self._prealloc_reservation_fits(
+@@ -1024,10 +1143,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         rids_to_check: Optional[List[str]] = None,
+         pp_good_rids: Optional[List[str]] = None,
+         pp_bad_rids: Optional[List[str]] = None,
++        pp_confirmed_aborts: Optional[set[str]] = None,
+     ) -> None:
          if not self.queue:
              return
  
@@ -1338,12 +1504,25 @@ index 2ee23a97..ce82ba55 100644
 +                    decode_req.req.bootstrap_room,
 +                    bootstrap_timeout,
 +                )
-+                decode_req.kv_receiver.abort()
++                decode_req.kv_receiver.abort("Decode handshake timed out.")
 +
          # Receiver polling observes asynchronous failures while KV allocation
          # is blocked.
          if self.pp_size > 1:
-@@ -1049,6 +1074,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+@@ -1042,6 +1185,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+             )
+ 
++        if pp_confirmed_aborts is None:
++            confirmed_aborts = _consensus_tokenizer_aborts(
++                self.queue, polls, getattr(self, "gloo_group", None)
++            )
++        else:
++            confirmed_aborts = pp_confirmed_aborts
+         for decode_req, poll in zip(self.queue, polls):
+             if poll is None:
+                 continue
+@@ -1049,27 +1198,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                  continue
  
              if poll == KVPoll.Bootstrapping:
@@ -1352,10 +1531,106 @@ index 2ee23a97..ce82ba55 100644
                  pass
              elif poll == KVPoll.WaitingForInput:
                  decode_req.waiting_for_input = True
-@@ -2631,6 +2658,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+                 decode_req.req.time_stats.set_bootstrap_done_time()
+             elif poll == KVPoll.Failed:
+-                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+-                is_propagated = False
+-                try:
+-                    decode_req.kv_receiver.failure_exception()
+-                except Exception as e:
+-                    error_message += f" with exception {e}"
+-                    is_propagated = getattr(e, "is_from_another_rank", False)
+-                # Mute error message for propagated exceptions to avoid duplicate logging
+-                if is_propagated:
+-                    logger.debug(error_message)
+-                else:
+-                    logger.error(error_message)
+-                prepare_abort(
+-                    decode_req.req,
+-                    error_message,
+-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
++                _finish_decode_kv_failure(
++                    decode_req,
++                    "handshake",
++                    self.tp_rank,
++                    confirmed_abort=decode_req.req.rid in confirmed_aborts,
+                 )
+                 if self.scheduler.metrics_reporter.enable_metrics:
+                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+@@ -1112,7 +1252,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 for decode_req in reqs:
+                     # kv_receiver may be None from a prior self.queue cleanup
+                     if decode_req.kv_receiver is not None:
+-                        decode_req.kv_receiver.abort()
++                        decode_req.kv_receiver.abort(error_msg)
+                 del self._ensure_retry_count[bootstrap_addr]
+                 del self._ensure_last_attempt_time[bootstrap_addr]
+             else:
+@@ -1233,6 +1373,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         rids_to_check: Optional[List[str]] = None,
+         pp_good_rids: Optional[List[str]] = None,
+         pp_bad_rids: Optional[List[str]] = None,
++        pp_confirmed_aborts: Optional[set[str]] = None,
+     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+         """Pop the preallocated requests from the pending queue (FIFO)."""
+         is_pp_mode = self.pp_size > 1
+@@ -1242,7 +1383,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             raise ValueError("rids_to_check cannot be used in PP mode")
+ 
+         self._resolve_pending_reqs()
+-        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
++        self._update_handshake_waiters(
++            rids_to_check, pp_good_rids, pp_bad_rids, pp_confirmed_aborts
++        )
+         if is_pp_mode:
+             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
+ 
+@@ -1375,18 +1518,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             if self.req_to_token_pool.available_size() <= 0:
+                 break
+ 
+-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
+-            # draining the mamba pool before the KV pool (would assert "Not
+-            # enough space for mamba cache"). Evict a cached mamba slot from
+-            # the radix tree first (only if it manages mamba states;
+-            # ChunkCache.evict is a no-op), else stop.
+-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
+-                supports_mamba = self.tree_cache.supports_mamba()
+-                if supports_mamba and hasattr(self.tree_cache, "evict"):
+-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+-                if mamba_allocator.available_size() <= 0:
+-                    break
++            if not self._ensure_mamba_prealloc_capacity(decode_req.req):
++                break
+ 
+             if hisparse_req_budget <= 0:
+                 break
+@@ -2613,7 +2746,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+                 return
+         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+ 
+-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
++    def pop_transferred(
++        self,
++        rids_to_check: Optional[List[str]] = None,
++        *,
++        pp_failed_rids: Optional[set[str]] = None,
++        pp_confirmed_aborts: Optional[set[str]] = None,
++    ) -> List[Req]:
+         if not self.queue:
+             return []
+ 
+@@ -2631,6 +2770,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
          else:
              polls = self._poll_with_metadata_gate()
  
++        if pp_confirmed_aborts is None:
++            confirmed_aborts = _consensus_tokenizer_aborts(
++                self.queue, polls, getattr(self, "gloo_group", None)
++            )
++        else:
++            confirmed_aborts = pp_confirmed_aborts
 +        transfer_timeout = float(
 +            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
 +        )
@@ -1364,7 +1639,56 @@ index 2ee23a97..ce82ba55 100644
          transferred_reqs = []
          indices_to_remove = set()
          # Queue-removed but held for deferred release; excluded from the metadata
-@@ -2752,7 +2784,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+@@ -2640,33 +2790,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                 continue
+ 
++            # A different PP stage can fail after this stage completed its KV transfer.
++            # Leave a still-active local destination on the usual drain path.
++            if (
++                poll == KVPoll.Success
++                and pp_failed_rids
++                and decode_req.req.rid in pp_failed_rids
++            ):
++                poll = KVPoll.Failed
++
+             hicache_restore_status = decode_req.hicache_restore_status
+             if (
+                 poll == KVPoll.Failed
+                 or hicache_restore_status == HiCacheRestoreResult.FAILED
+             ):
+-                error_message = (
+-                    f"Decode transfer failed for request rank={self.tp_rank} "
+-                    f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
++                _finish_decode_kv_failure(
++                    decode_req,
++                    "transfer",
++                    self.tp_rank,
++                    poll == KVPoll.Failed,
++                    confirmed_abort=decode_req.req.rid in confirmed_aborts,
+                 )
+-                is_propagated = False
+-                if poll == KVPoll.Failed:
+-                    try:
+-                        decode_req.kv_receiver.failure_exception()
+-                    except Exception as e:
+-                        error_message += f" with exception {e}"
+-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                 self._clean_hicache_prefetch_resources(decode_req)
+-                # Mute error message for propagated exceptions to avoid duplicate logging
+-                if is_propagated:
+-                    logger.debug(error_message)
+-                else:
+-                    logger.error(error_message)
+-                prepare_abort(
+-                    decode_req.req,
+-                    error_message,
+-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+-                )
+                 self.scheduler.output_streamer.stream_output(
+                     [decode_req.req],
+                     decode_req.req.return_logprob,
+@@ -2752,7 +2897,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                  KVPoll.WaitingForInput,
                  KVPoll.Transferring,
              ]:
@@ -1379,11 +1703,76 @@ index 2ee23a97..ce82ba55 100644
 +                        decode_req.req.bootstrap_room,
 +                        transfer_timeout,
 +                    )
-+                    decode_req.kv_receiver.abort()
++                    decode_req.kv_receiver.abort("Decode transfer timed out.")
              else:
                  raise ValueError(f"Unexpected poll case: {poll}")
  
-@@ -2859,6 +2901,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+@@ -2807,40 +2962,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+         """Release drained transfers; device destinations may also time out."""
+         if not self._deferred_releases:
+             return
+-        host_ready = torch.tensor(
+-            [
+-                req.kv_receiver.kv_mgr.is_abort_release_safe(
+-                    req.req.bootstrap_room, acks
+-                )
+-                for req, _, _, acks in self._deferred_releases
+-                if self.enable_host_receive and req.host_staged
+-            ],
+-            dtype=torch.int32,
+-        )
+-        if host_ready.numel() and torch.distributed.get_world_size(self.gloo_group) > 1:
+-            # Admission must see identical host capacity and page order on every rank.
++        now = time.monotonic()
++        release_states = []
++        for req, deadline, _, acks in self._deferred_releases:
++            if req.kv_receiver.kv_mgr.is_abort_release_safe(
++                req.req.bootstrap_room, acks
++            ):
++                state = 2  # Drained.
++            elif not (self.enable_host_receive and req.host_staged) and now >= deadline:
++                state = 1  # Device-only timeout fallback; host writes must drain.
++            else:
++                state = 0  # Keep the destination reserved.
++            release_states.append(state)
++        release_states = torch.tensor(release_states, dtype=torch.int32)
++        if torch.distributed.get_world_size(self.gloo_group) > 1:
++            # Device capacity and allocator order must agree too: a local ACK
++            # must not let one rank admit a request while its peers keep polling.
+             torch.distributed.all_reduce(
+-                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
++                release_states, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+             )
+-        host_ready = iter(host_ready.tolist())
+-        now = time.monotonic()
+         still_held = []
+         to_release = []
+-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
+-            room = decode_req.req.bootstrap_room
+-            if self.enable_host_receive and decode_req.host_staged:
+-                if next(host_ready):
+-                    to_release.append((decode_req, idx, room, True))
+-                else:
+-                    # A timeout cannot prove that a remote write has stopped.
+-                    still_held.append((decode_req, deadline, idx, required_acks))
+-                continue
+-            kv_mgr = decode_req.kv_receiver.kv_mgr
+-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
+-            if not drained and now < deadline:
+-                still_held.append((decode_req, deadline, idx, required_acks))
++        for entry, state in zip(self._deferred_releases, release_states.tolist()):
++            decode_req, deadline, idx, required_acks = entry
++            if state == 0:
++                still_held.append(entry)
+             else:
+-                to_release.append((decode_req, idx, room, drained))
++                to_release.append(
++                    (decode_req, idx, decode_req.req.bootstrap_room, state == 2)
++                )
+         # Commit the survivors before releasing so a _do_release exception can't
+         # leave a released entry in the list (double-free / None receiver on retry).
+         self._deferred_releases = still_held
+@@ -2859,6 +3009,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
  
      def release_memory_occupation(self):
          """Clean up in-flight transfers before releasing GPU memory."""
@@ -1393,7 +1782,7 @@ index 2ee23a97..ce82ba55 100644
          self.queue.clear()
          # Pool is being torn down; drop held entries without per-request release.
          self._deferred_releases.clear()
-@@ -3184,6 +3229,11 @@ class SchedulerDisaggregationDecodeMixin:
+@@ -3184,6 +3337,11 @@ class SchedulerDisaggregationDecodeMixin:
          resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
          self.waiting_queue.extend(resumed_reqs)
          if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
@@ -1406,10 +1795,19 @@ index 2ee23a97..ce82ba55 100644
              return
  
 diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
-index 0f0edd88..f1c34629 100644
+index 0f0edd88..9141e888 100644
 --- a/python/sglang/srt/disaggregation/mooncake/conn.py
 +++ b/python/sglang/srt/disaggregation/mooncake/conn.py
-@@ -1491,7 +1491,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+@@ -17,6 +17,8 @@ from prometheus_client import Counter
+ 
+ from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+ from sglang.srt.disaggregation.common.conn import (
++    TOKENIZER_ABORT_TAG,
++    KVPeerTokenizerAbort,
+     CommonKVBootstrapServer,
+     CommonKVManager,
+     CommonKVReceiver,
+@@ -1491,7 +1493,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
          for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
              length = prefill_aux_item_lens[i]
              src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
@@ -1418,7 +1816,7 @@ index 0f0edd88..f1c34629 100644
              transfer_blocks.append((src_addr, dst_addr, length))
  
          return self._transfer_data(req.mooncake_session_id, transfer_blocks)
-@@ -2304,12 +2304,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+@@ -2304,12 +2306,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                          if ret != 0:
                              with self.session_lock:
                                  self.session_failures[req.mooncake_session_id] += 1
@@ -1431,8 +1829,89 @@ index 0f0edd88..f1c34629 100644
                              self.conclude_failure(
                                  bootstrap_room=kv_chunk.room,
                                  failure_reason=(
+@@ -2450,9 +2446,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                     decode_ip = waiting_req_bytes[2].decode("ascii")
+                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
++                    # Old four-frame ABORTs remain untyped. Only an explicit
++                    # versioned control proof can later authorize a canonical 499.
++                    if (
++                        len(waiting_req_bytes) == 6
++                        and waiting_req_bytes[4] == TOKENIZER_ABORT_TAG
++                    ):
++                        try:
++                            control_rid = waiting_req_bytes[5].decode("utf-8")
++                        except UnicodeDecodeError:
++                            control_rid = ""
++                        with self.failure_lock:
++                            if control_rid and self.request_status.get(
++                                room_to_be_aborted
++                            ) in (
++                                KVPoll.Bootstrapping,
++                                KVPoll.WaitingForInput,
++                                KVPoll.Transferring,
++                            ):
++                                self.failure_records.setdefault(
++                                    room_to_be_aborted,
++                                    KVPeerTokenizerAbort(control_rid),
++                                )
++                    room_status = self.request_status.get(room_to_be_aborted)
+                     room_active = (
+-                        room_to_be_aborted in self.request_status
+-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
++                        room_status is not None and room_status != KVPoll.Success
+                     )
+                     if self.enable_deferred_decode_kv_release:
+                         # Mark Failed FIRST (stops add_transfer_request enqueuing
+@@ -2744,19 +2762,30 @@ class MooncakeFailureExceptionMixin:
+     """
+ 
+     def failure_exception(self):
+-        # A room with no locally recorded reason failed on another rank.
++        # Consume one final cause snapshot and deactivate the room under the
++        # same lock used to register typed peer proofs. The rest of clear()
++        # may send drain ACKs, so it must run outside this lock.
++        with self.kv_mgr.failure_lock:
++            local_status = self.kv_mgr.request_status.pop(self.bootstrap_room, None)
++            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
++            is_poll_propagated = (
++                failure_reason is None
++                and local_status is not None
++                and local_status != KVPoll.Failed
++                and self.conclude_state != KVPoll.Failed
++            )
+         if self.conclude_state is None:
+             self.conclude_state = KVPoll.Failed
+-
+         self.clear()
+ 
+-        with self.kv_mgr.failure_lock:
+-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+         is_propagated = failure_reason is None
+         if is_propagated:
+             failure_reason = "Failed due to an unknown reason from another rank"
+         raise KVTransferError(
+-            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
++            self.bootstrap_room,
++            failure_reason,
++            is_from_another_rank=is_propagated,
++            is_poll_propagated=is_poll_propagated,
+         )
+ 
+ 
+@@ -2854,8 +2883,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+ 
+         self.trace_ctx.trace_req_start()
+ 
+-    def abort(self):
+-        super().abort()
++    def abort(self, reason: str = "Aborted by AbortReq."):
++        super().abort(reason)
+         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
+         self.trace_ctx.trace_req_finish()
+ 
 diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
-index b72dc2a2..9e725912 100644
+index b72dc2a2..51e8f589 100644
 --- a/python/sglang/srt/disaggregation/prefill.py
 +++ b/python/sglang/srt/disaggregation/prefill.py
 @@ -21,6 +21,8 @@ from __future__ import annotations
@@ -1444,7 +1923,22 @@ index b72dc2a2..9e725912 100644
  from array import array
  from collections import deque
  from http import HTTPStatus
-@@ -153,6 +155,55 @@ def maybe_release_metadata_buffer(
+@@ -37,7 +39,13 @@ from sglang.srt.disaggregation.checksum import (
+     page_indices_for_request,
+     state_indices_for_request,
+ )
+-from sglang.srt.disaggregation.common.conn import CommonKVManager
++from sglang.srt.disaggregation.common.conn import (
++    CommonKVManager,
++    CommonKVSender,
++    KVAbortReason,
++    KVPeerTokenizerAbort,
++    KVTransferError,
++)
+ from sglang.srt.disaggregation.common.staging_buffer import (
+     compute_grid_segments,
+     staging_grid_tokens,
+@@ -153,6 +161,55 @@ def maybe_release_metadata_buffer(
          req.metadata_buffer_index = -1
  
  
@@ -1500,7 +1994,7 @@ index b72dc2a2..9e725912 100644
  class PrefillBootstrapQueue:
      """
      Store the requests in bootstrapping
-@@ -446,6 +497,22 @@ class PrefillBootstrapQueue:
+@@ -446,6 +503,22 @@ class PrefillBootstrapQueue:
          """
          req.sampling_params.max_new_tokens = 1
  
@@ -1523,7 +2017,7 @@ index b72dc2a2..9e725912 100644
      @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
      def pop_bootstrapped(
          self,
-@@ -478,22 +545,8 @@ class PrefillBootstrapQueue:
+@@ -478,22 +551,8 @@ class PrefillBootstrapQueue:
                  pp_good_rids,
                  pp_bad_rids,
              )
@@ -1547,7 +2041,7 @@ index b72dc2a2..9e725912 100644
  
          for i, (req, poll) in enumerate(zip(self.queue, polls)):
              if poll is None:
-@@ -1001,6 +1054,21 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1001,6 +1060,21 @@ class SchedulerDisaggregationPrefillMixin:
          )
          self.maybe_send_health_check_signal()
  
@@ -1569,7 +2063,7 @@ index b72dc2a2..9e725912 100644
      @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
      def process_disagg_prefill_inflight_queue(
          self: Scheduler, rids_to_check: Optional[List[str]] = None
-@@ -1014,11 +1082,7 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1014,11 +1088,7 @@ class SchedulerDisaggregationPrefillMixin:
  
          done_reqs = []
  
@@ -1582,7 +2076,7 @@ index b72dc2a2..9e725912 100644
  
          undone_reqs: List[Req] = []
          # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-@@ -1057,6 +1121,7 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1057,6 +1127,7 @@ class SchedulerDisaggregationPrefillMixin:
                  undone_reqs.append(req)
              elif poll == KVPoll.Success:  # transfer done
                  if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1590,7 +2084,112 @@ index b72dc2a2..9e725912 100644
                      req.finished_reason = FINISH_LENGTH(length=0)
                  release_kv_cache(req, self.tree_cache)  # unlock the tree
                  self.tree_cache.finish(
-@@ -1207,7 +1272,9 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1112,6 +1183,53 @@ class SchedulerDisaggregationPrefillMixin:
+ 
+         return done_reqs
+ 
++    def abort_prefill_sender(self: Scheduler, req: Req, control) -> None:
++        sender = req.disagg_kv_sender
++        if (
++            isinstance(sender, CommonKVSender)
++            and control.is_tokenizer_abort_for(req.rid)
++        ):
++            sender.abort(KVAbortReason.TOKENIZER)
++        else:
++            sender.abort()
++
++    def _confirm_prefill_tokenizer_abort(
++        self: Scheduler, req: Req, exc: Optional[Exception]
++    ) -> bool:
++        # All ranks enter after the existing Failed poll consensus, including
++        # ranks whose local poll was still active when a peer first cancelled.
++        # Only the consumed final exception can provide a neutral/typed proof.
++        # PP release consensus does not carry the cause; keep that path fail-closed.
++        if get_parallel().pp_size != 1:
++            return False
++        same_room = (
++            isinstance(exc, KVTransferError)
++            and exc.bootstrap_room == req.bootstrap_room
++        )
++        proof = same_room and (
++            exc.failure_reason is KVAbortReason.TOKENIZER
++            or (
++                isinstance(exc.failure_reason, KVPeerTokenizerAbort)
++                and exc.failure_reason.request_id == req.rid
++            )
++        )
++        neutral = same_room and exc.is_poll_propagated
++        veto = not (proof or neutral)
++        identity = (req.rid, req.bootstrap_room)
++        if torch.distributed.is_initialized():
++            for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
++                size = torch.distributed.get_world_size(group)
++                if size > 1:
++                    votes = [None] * size
++                    torch.distributed.all_gather_object(
++                        votes, (*identity, proof, veto), group=group
++                    )
++                    proof = any(item[2] for item in votes)
++                    veto = any(
++                        item[3] or tuple(item[:2]) != identity for item in votes
++                    )
++        return proof and not veto
++
+     def handle_inflight_transfer_failure(
+         self: Scheduler, req: Req
+     ) -> Optional[Exception]:
+@@ -1126,6 +1244,7 @@ class SchedulerDisaggregationPrefillMixin:
+         except Exception as e:
+             exc = e
+             error_message += f" with exception {e}"
++        confirmed_abort = self._confirm_prefill_tokenizer_abort(req, exc)
+         # Mute error message for propagated exceptions to avoid duplicate logging
+         if getattr(exc, "is_from_another_rank", False):
+             logger.debug(error_message)
+@@ -1135,9 +1254,12 @@ class SchedulerDisaggregationPrefillMixin:
+         release_kv_cache(req, self.tree_cache)  # unlock the tree
+         self._release_aborted_request(req)
+         if not isinstance(req.finished_reason, FINISH_ABORT):
+-            prepare_abort(
+-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+-            )
++            if confirmed_abort:
++                prepare_abort(req, f"Request {req.rid} was aborted", status_code=499)
++            else:
++                prepare_abort(
++                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
++                )
+         if self.metrics_reporter.enable_metrics:
+             self.metrics_collector.increment_transfer_failed_reqs()
+         return exc
+@@ -1185,12 +1307,15 @@ class SchedulerDisaggregationPrefillMixin:
+             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
+             f"{req.rid=} {req.bootstrap_room=}"
+         )
++        exc: Optional[Exception] = None
+         is_propagated = False
+         try:
+             req.disagg_kv_sender.failure_exception()
+         except Exception as e:
++            exc = e
+             error_message += f" with exception {e}"
+             is_propagated = getattr(e, "is_from_another_rank", False)
++        confirmed_abort = self._confirm_prefill_tokenizer_abort(req, exc)
+         # Mute error message for propagated exceptions to avoid duplicate logging
+         if is_propagated:
+             logger.debug(error_message)
+@@ -1201,13 +1326,19 @@ class SchedulerDisaggregationPrefillMixin:
+             release_kv_cache(req, self.tree_cache, is_insert=False)
+         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+         req.pending_bootstrap = False
+-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
++        if confirmed_abort:
++            if not isinstance(req.finished_reason, FINISH_ABORT):
++                prepare_abort(req, f"Request {req.rid} was aborted", status_code=499)
++        else:
++            prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+         self.output_streamer.stream_output([req], req.return_logprob)
+         if self.metrics_reporter.enable_metrics:
              self.metrics_collector.increment_bootstrap_failed_reqs()
          self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
  
@@ -1601,7 +2200,7 @@ index b72dc2a2..9e725912 100644
          """Return True when bootstrap is finalized and KV transfer can proceed."""
          if poll == KVPoll.Failed:
              self.handle_bootstrap_failure(req)
-@@ -1220,7 +1287,7 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1220,7 +1351,7 @@ class SchedulerDisaggregationPrefillMixin:
              # Metadata buffer was allocated in pop_bootstrapped before
              # the request entered the waiting queue, so finalize should not fail.
              assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
@@ -1610,7 +2209,7 @@ index b72dc2a2..9e725912 100644
              return True
          else:
              raise RuntimeError(
-@@ -1237,7 +1304,9 @@ class SchedulerDisaggregationPrefillMixin:
+@@ -1237,7 +1368,9 @@ class SchedulerDisaggregationPrefillMixin:
              self.attn_cp_cpu_group,
              self.attn_tp_cpu_group,
          )
@@ -3167,7 +3766,7 @@ index 52c72a0e..b9f676c8 100755
          ):
              # Even the last remaining request cannot fit in memory.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a7d8baee..796e7661 100644
+index a7d8baee..d6ad249c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
@@ -3242,7 +3841,57 @@ index a7d8baee..796e7661 100644
          if self.is_fully_idle(ignore_waiting=self._engine_paused):
              self.cur_batch_for_debug = None
              self.last_batch = None
-@@ -5679,6 +5702,7 @@ class Scheduler(
+@@ -5516,7 +5539,7 @@ class Scheduler(
+                     self._release_aborted_request(req)
+ 
+                     if hasattr(req.disagg_kv_sender, "abort"):
+-                        req.disagg_kv_sender.abort()
++                        self.abort_prefill_sender(req, recv_req)
+                     if get_parallel().pp_size > 1:
+                         prepare_abort(req, "Aborted by AbortReq.")
+ 
+@@ -5525,14 +5548,14 @@ class Scheduler(
+                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                     if hasattr(req.disagg_kv_sender, "abort"):
+-                        req.disagg_kv_sender.abort()
++                        self.abort_prefill_sender(req, recv_req)
+ 
+         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+             # Abort requests that have not yet finished preallocation
+             for decode_req in self.disagg_decode_prealloc_queue.queue:
+                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+-                    decode_req.kv_receiver.abort()
++                    decode_req.abort_kv(recv_req)
+                     if get_parallel().pp_size > 1:
+                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
+ 
+@@ -5542,12 +5565,21 @@ class Scheduler(
+                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                     if decode_req.host_staged:
+                         # Keep the host destination alive until prefill stops writing.
+-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
++                        req = decode_req.req
++                        if req.finished_reason is None:
++                            if recv_req.is_tokenizer_abort_for(req.rid):
++                                prepare_abort(
++                                    req,
++                                    f"Request {req.rid} was aborted",
++                                    status_code=499,
++                                )
++                            else:
++                                prepare_abort(req, "Aborted by AbortReq.")
+                         continue
+                     # The receiver arms drain-ack accounting before sending the
+                     # ABORT (see CommonKVReceiver._send_abort_notification), so
+                     # an ack racing back is never dropped.
+-                    decode_req.kv_receiver.abort()
++                    decode_req.abort_kv(recv_req)
+ 
+             # Abort requests whose KV is already backed up for retraction.
+             if self.disagg_decode_prealloc_queue.retracted_queue:
+@@ -5679,6 +5711,7 @@ class Scheduler(
          self.kv_events_publisher.publish_kv_events()
  
      def continue_generation(self, recv_req: ContinueGenerationReqInput):
@@ -3250,21 +3899,52 @@ index a7d8baee..796e7661 100644
          if recv_req.torch_empty_cache:
              before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
              torch.cuda.empty_cache()
-@@ -5796,6 +5820,14 @@ class Scheduler(
-         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-         return result
+@@ -5793,7 +5826,16 @@ class Scheduler(
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+         """In-place loading a new lora adapter from serialized tensors."""
  
+-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
++        if recv_req.relax_attempt_id is not None:
++            return self._managed_lora_update(self.tp_worker.load_lora_adapter_from_tensors, recv_req)
++        return self.tp_worker.load_lora_adapter_from_tensors(recv_req)
++
 +    def update_lora_from_distributed(
 +        self, recv_req: UpdateLoRAFromDistributedReqInput
 +    ) -> UpdateLoRAFromDistributedReqOutput:
 +        """In-place loading a new lora adapter whose tensors arrive over NCCL."""
 +
 +        result = self.tp_worker.update_lora_from_distributed(recv_req)
-+        return result
-+
+         return result
+ 
      def unload_lora_adapter(
-         self, recv_req: UnloadLoRAAdapterReqInput
+@@ -5801,8 +5843,25 @@ class Scheduler(
      ) -> UnloadLoRAAdapterReqOutput:
+         """Unload the lora adapter."""
+ 
+-        result = self.tp_worker.unload_lora_adapter(recv_req)
+-        return result
++        if recv_req.lora_name.startswith("relax_lora@"):
++            return self._managed_lora_update(self.tp_worker.unload_lora_adapter, recv_req)
++        return self.tp_worker.unload_lora_adapter(recv_req)
++
++    def _managed_lora_update(self, operation, req):
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        try:
++            result = operation(req)
++        except Exception as exc:
++            result = LoRAUpdateOutput(success=False, error_message=str(exc))
++        results = [None] * get_parallel().tp_size
++        torch.distributed.all_gather_object(results, result, group=self.tp_cpu_group)
++        errors = [r.error_message or "worker failed" for r in results if not r.success]
++        if errors:
++            return LoRAUpdateOutput(success=False, error_message=" | ".join(errors))
++        if any(r.fingerprints != results[0].fingerprints for r in results):
++            return LoRAUpdateOutput(success=False, error_message="TP fingerprint mismatch")
++        return results[0]
+ 
+     def init_weights_send_group_for_remote_instance(
+         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 index e0f922fe..3aac7696 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
@@ -7545,50 +8225,6 @@ index d1f593a..adafa3c 100644
      success: bool
      error_message: Optional[str] = None
      loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
-diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 796e766..8ede95e 100644
---- a/python/sglang/srt/managers/scheduler.py
-+++ b/python/sglang/srt/managers/scheduler.py
-@@ -5817,8 +5817,9 @@ class Scheduler(
-     ) -> LoadLoRAAdapterFromTensorsReqOutput:
-         """In-place loading a new lora adapter from serialized tensors."""
- 
--        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
--        return result
-+        if recv_req.relax_attempt_id is not None:
-+            return self._managed_lora_update(self.tp_worker.load_lora_adapter_from_tensors, recv_req)
-+        return self.tp_worker.load_lora_adapter_from_tensors(recv_req)
- 
-     def update_lora_from_distributed(
-         self, recv_req: UpdateLoRAFromDistributedReqInput
-@@ -5833,8 +5834,25 @@ class Scheduler(
-     ) -> UnloadLoRAAdapterReqOutput:
-         """Unload the lora adapter."""
- 
--        result = self.tp_worker.unload_lora_adapter(recv_req)
--        return result
-+        if recv_req.lora_name.startswith("relax_lora@"):
-+            return self._managed_lora_update(self.tp_worker.unload_lora_adapter, recv_req)
-+        return self.tp_worker.unload_lora_adapter(recv_req)
-+
-+    def _managed_lora_update(self, operation, req):
-+        from sglang.srt.managers.io_struct import LoRAUpdateOutput
-+
-+        try:
-+            result = operation(req)
-+        except Exception as exc:
-+            result = LoRAUpdateOutput(success=False, error_message=str(exc))
-+        results = [None] * get_parallel().tp_size
-+        torch.distributed.all_gather_object(results, result, group=self.tp_cpu_group)
-+        errors = [r.error_message or "worker failed" for r in results if not r.success]
-+        if errors:
-+            return LoRAUpdateOutput(success=False, error_message=" | ".join(errors))
-+        if any(r.fingerprints != results[0].fingerprints for r in results):
-+            return LoRAUpdateOutput(success=False, error_message="TP fingerprint mismatch")
-+        return results[0]
- 
-     def init_weights_send_group_for_remote_instance(
-         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
 index 26072a6..9a7be0d 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
@@ -11888,28 +12524,101 @@ diff --git a/python/sglang/srt/disaggregation/base/conn.py b/python/sglang/srt/d
          Abort the current transfer.
          """
 diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt/disaggregation/common/conn.py
+index e56796d5..1a123227 100644
 --- a/python/sglang/srt/disaggregation/common/conn.py
 +++ b/python/sglang/srt/disaggregation/common/conn.py
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ import logging
  import threading
  import time
  from collections import defaultdict
 +from enum import Enum
  from typing import Dict, List, Optional, Set, Tuple, Union
-
+ 
  import numpy as np
-@@ -73,6 +74,10 @@
-         )
-         sessions[bootstrap_addr] = session
+@@ -75,17 +76,38 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
      return session
-+
-+
+ 
+ 
 +class KVAbortReason(str, Enum):
 +    TOKENIZER = "Cancelled by tokenizer control."
-
-
++
++
++TOKENIZER_ABORT_TAG = b"TOKENIZER_CANCEL_V1"
++
++
++class KVPeerTokenizerAbort(str):
++    """Typed peer control proof. Plain reason strings cannot authorize a 499."""
++
++    def __new__(cls, request_id: str):
++        reason = super().__new__(cls, "Cancelled by peer tokenizer control.")
++        reason.request_id = request_id
++        return reason
++
++    def __reduce__(self):
++        return (type(self), (self.request_id,))
++
++
  class KVTransferError(Exception):
-@@ -885,17 +890,10 @@
+     def __init__(
+         self,
+         bootstrap_room: int,
+         failure_reason: str,
+         is_from_another_rank: bool = False,
++        is_poll_propagated: bool = False,
+     ):
+         super().__init__(failure_reason)
+         self.bootstrap_room = bootstrap_room
+         self.failure_reason = failure_reason
+         self.is_from_another_rank = is_from_another_rank
++        self.is_poll_propagated = is_poll_propagated
+ 
+     def __str__(self):
+         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+@@ -413,24 +435,25 @@ class CommonKVManager(BaseKVManager):
+         return self.request_status[bootstrap_room]
+ 
+     def update_status(self, bootstrap_room: int, status: KVPoll):
+-        current = self.request_status.get(bootstrap_room)
+-        if current is None:
+-            # The room does not exist yet, or clear() already popped it. Only a
+-            # request's opening status may create it: Bootstrapping normally, or
+-            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
+-            # Anything else would resurrect a concluded room and pollute a later
+-            # request that reuses the same bootstrap_room.
+-            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+-                self.request_status[bootstrap_room] = status
+-            return
+-        if status == KVPoll.Failed:
+-            self.request_status[bootstrap_room] = KVPoll.Failed
+-            return
+-        if current == KVPoll.Failed:
+-            # Failed is terminal. It also sorts lowest, so the max() below would
+-            # happily promote it back to Transferring or Success.
+-            return
+-        self.request_status[bootstrap_room] = max(current, status)
++        with self.failure_lock:
++            current = self.request_status.get(bootstrap_room)
++            if current is None:
++                # The room does not exist yet, or clear() already popped it. Only a
++                # request's opening status may create it: Bootstrapping normally, or
++                # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
++                # Anything else would resurrect a concluded room and pollute a later
++                # request that reuses the same bootstrap_room.
++                if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
++                    self.request_status[bootstrap_room] = status
++                return
++            if status == KVPoll.Failed:
++                self.request_status[bootstrap_room] = KVPoll.Failed
++                return
++            if current == KVPoll.Failed:
++                # Failed is terminal. It also sorts lowest, so the max() below would
++                # happily promote it back to Transferring or Success.
++                return
++            self.request_status[bootstrap_room] = max(current, status)
+ 
+     def record_failure(self, bootstrap_room: int, failure_reason: str):
+         with self.failure_lock:
+@@ -885,17 +908,10 @@ class CommonKVManager(BaseKVManager):
      def _fail_prefill_recompute(
          self, kv_receiver: CommonKVReceiver, reason: str
      ) -> None:
@@ -11928,13 +12637,61 @@ diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt
 +        with self.failure_lock:
 +            self.failure_records.setdefault(kv_receiver.bootstrap_room, reason)
 +        kv_receiver.abort(reason)
-
+ 
      def _run_prefill_recompute(
          self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
-@@ -2013,11 +2011,14 @@
+@@ -1692,7 +1708,8 @@ class CommonKVSender(BaseKVSender):
+         return KVPoll.Failed
+ 
+     def clear(self) -> None:
+-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
++        with self.kv_mgr.failure_lock:
++            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+         if hasattr(self.kv_mgr, "transfer_infos"):
+@@ -1708,11 +1725,14 @@ class CommonKVSender(BaseKVSender):
+                     self.bootstrap_room, None
+                 )
+ 
+-    def abort(self):
+-        self.kv_mgr.record_failure(
+-            self.bootstrap_room,
+-            "Aborted by AbortReq.",
+-        )
++    def abort(self, reason: str = "Aborted by AbortReq."):
++        # A late control cannot replace a real transfer failure.
++        with self.kv_mgr.failure_lock:
++            if (
++                self.conclude_state != KVPoll.Failed
++                and self.kv_mgr.request_status.get(self.bootstrap_room) != KVPoll.Failed
++            ):
++                self.kv_mgr.failure_records.setdefault(self.bootstrap_room, reason)
+         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+         self.conclude_state = KVPoll.Failed
+ 
+@@ -1737,6 +1757,7 @@ class CommonKVReceiver(BaseKVReceiver):
+         self.require_staging: bool = False
+         self.init_time: Optional[float] = None
+         self.abort_notified: bool = False
++        self.tokenizer_abort_rid: Optional[str] = None
+         self._connection_pool_entries: Dict[str, List[Dict]] = {}
+         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+@@ -2006,18 +2027,23 @@ class CommonKVReceiver(BaseKVReceiver):
+         return KVPoll.Failed
+ 
+     def clear(self) -> None:
+-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
++        self.tokenizer_abort_rid = None
++        with self.kv_mgr.failure_lock:
++            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
              self.bootstrap_room
          )
-
+ 
 -    def abort(self):
 -        self.kv_mgr.record_failure(
 -            self.bootstrap_room,
@@ -11951,6 +12708,34 @@ diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt
          self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
          self.conclude_state = KVPoll.Failed
          self.ensure_abort_notified()
+@@ -2047,6 +2073,18 @@ class CommonKVReceiver(BaseKVReceiver):
+             force_arm or self.init_time is not None
+         ):
+             self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
++        control_frames = []
++        if getattr(self, "tokenizer_abort_rid", None):
++            with self.kv_mgr.failure_lock:
++                if (
++                    self.kv_mgr.failure_records.get(self.bootstrap_room)
++                    is KVAbortReason.TOKENIZER
++                    and self.tokenizer_abort_rid
++                ):
++                    control_frames = [
++                        TOKENIZER_ABORT_TAG,
++                        self.tokenizer_abort_rid.encode("utf-8"),
++                    ]
+         for bootstrap_info in self.bootstrap_infos:
+             # Best-effort notification to prefill side that this request was aborted.
+             try:
+@@ -2058,7 +2096,7 @@ class CommonKVReceiver(BaseKVReceiver):
+                             str(self.bootstrap_room).encode("ascii"),
+                             self.kv_mgr.local_ip.encode("ascii"),
+                             str(self.kv_mgr.rank_port).encode("ascii"),
+-                        ]
++                        ] + control_frames
+                     )
+                 logger.debug(
+                     f"Sent abort notification for room {self.bootstrap_room} "
 diff --git a/python/sglang/srt/disaggregation/fake/conn.py b/python/sglang/srt/disaggregation/fake/conn.py
 --- a/python/sglang/srt/disaggregation/fake/conn.py
 +++ b/python/sglang/srt/disaggregation/fake/conn.py
@@ -11997,427 +12782,6 @@ diff --git a/python/sglang/srt/disaggregation/mori/conn.py b/python/sglang/srt/d
 
 
  class MoriKVBootstrapServer(CommonKVBootstrapServer):
-diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
-index ce82ba554af32f9696070d98209a336f3fc760e7..b45172d92cc49ac1decca2550f513cb53d0847f4 100644
---- a/python/sglang/srt/disaggregation/decode.py
-+++ b/python/sglang/srt/disaggregation/decode.py
-@@ -44,7 +44,12 @@ from sglang.srt.disaggregation.checksum import (
-     page_indices_for_request,
-     state_indices_for_request,
- )
--from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
-+from sglang.srt.disaggregation.common.conn import (
-+    CommonKVManager,
-+    CommonKVReceiver,
-+    KVAbortReason,
-+    KVTransferError,
-+)
- from sglang.srt.disaggregation.decode_hicache_mixin import (
-     DecodeHiCachePreallocMixin,
-     DecodeHiCacheTransferMixin,
-@@ -132,6 +137,7 @@ logger = logging.getLogger(__name__)
- _is_npu = is_npu()
-
- if TYPE_CHECKING:
-+    from sglang.srt.managers.io_struct import AbortReq
-     from sglang.srt.managers.schedule_batch import Req
-     from sglang.srt.managers.scheduler import Scheduler
-
-@@ -358,6 +364,14 @@ class DecodeRequest:
-     hicache_load_consumer_index: int = -1
-     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
-
-+    def abort_kv(self, control: AbortReq) -> None:
-+        reason = (
-+            KVAbortReason.TOKENIZER
-+            if control.is_tokenizer_abort_for(self.req.rid)
-+            else control.abort_message or "Scheduler aborted the KV transfer."
-+        )
-+        self.kv_receiver.abort(reason)
-+
-     @property
-     def seqlen(self) -> int:
-         return self.req.seqlen
-@@ -367,6 +381,79 @@ class DecodeRequest:
-         return self.req.priority
-
-
-+def _consensus_tokenizer_aborts(queue, polls, *gloo_groups) -> set[str]:
-+    """Vote only for failed rooms, after every rank has the same terminal poll."""
-+    if KVPoll.Failed not in polls:
-+        return set()
-+    failed = [item for item, poll in zip(queue, polls) if poll == KVPoll.Failed]
-+    votes = []
-+    for item in failed:
-+        receiver = item.kv_receiver
-+        manager = getattr(receiver, "kv_mgr", None)
-+        lock = getattr(manager, "failure_lock", None)
-+        agreed = False
-+        if (
-+            lock is not None
-+            and item.hicache_restore_status != HiCacheRestoreResult.FAILED
-+        ):
-+            with lock:
-+                agreed = (
-+                    manager.failure_records.get(item.req.bootstrap_room)
-+                    is KVAbortReason.TOKENIZER
-+                )
-+        votes.append(agreed)
-+    if torch.distributed.is_initialized():
-+        for group in gloo_groups:
-+            if torch.distributed.get_world_size(group) > 1:
-+                ballot = torch.tensor(votes, dtype=torch.uint8, device="cpu")
-+                torch.distributed.all_reduce(
-+                    ballot, op=torch.distributed.ReduceOp.MIN, group=group
-+                )
-+                votes = ballot.tolist()
-+    return {item.req.rid for item, agreed in zip(failed, votes) if agreed}
-+
-+
-+def _finish_decode_kv_failure(
-+    decode_req: DecodeRequest,
-+    stage: str,
-+    rank: int,
-+    kv_failed: bool = True,
-+    *,
-+    confirmed_abort: bool = True,
-+) -> None:
-+    req = decode_req.req
-+    message = (
-+        f"Decode {stage} failed for request rank={rank} decode_req.req.rid={req.rid!r} "
-+        f"decode_req.req.bootstrap_room={req.bootstrap_room}"
-+    )
-+    propagated = False
-+    if kv_failed:
-+        try:
-+            decode_req.kv_receiver.failure_exception()
-+        except Exception as exc:
-+            if (
-+                isinstance(exc, KVTransferError)
-+                and exc.bootstrap_room == req.bootstrap_room
-+                and exc.failure_reason is KVAbortReason.TOKENIZER
-+            ):
-+                if decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
-+                    message += " during HiCache restore"
-+                elif confirmed_abort:
-+                    prepare_abort(
-+                        req, f"Request {req.rid} was aborted", status_code=499
-+                    )
-+                    return
-+                else:
-+                    message += (
-+                        " because another rank did not confirm tokenizer cancellation"
-+                    )
-+            else:
-+                message += f" with exception {exc}"
-+            propagated = getattr(exc, "is_from_another_rank", False)
-+    (logger.debug if propagated else logger.error)(message)
-+    prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-+
-+
- class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-     """
-     Store the requests that are preallocating.
-@@ -949,6 +1036,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-         if hasattr(self.kv_manager, "register_buffer_to_engine"):
-             self.kv_manager.register_buffer_to_engine()
-
-+    def _ensure_mamba_prealloc_capacity(self, req: Req) -> bool:
-+        """Reclaim enough slots for this request before allocating any state."""
-+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-+        if allocator is None:
-+            return True
-+        # Prefix COW and request allocation share the main state. Reusing a
-+        # state or an existing ping-pong buffer must not charge it twice.
-+        needed = int(not req.kv.holds_mamba)
-+        if (
-+            self.req_to_token_pool.enable_mamba_extra_buffer
-+            and req.kv.mamba_ping_pong_track_buffer is None
-+        ):
-+            needed += (
-+                1
-+                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy
-+                else self.req_to_token_pool.mamba_ping_pong_track_buffer_size
-+            )
-+        available = allocator.schedulable_available_size()
-+        if available >= needed:
-+            return True
-+        if self.tree_cache.supports_mamba():
-+            self.tree_cache.evict_for_alloc(
-+                EvictParams(num_tokens=0, mamba_num=needed - available)
-+            )
-+        return allocator.schedulable_available_size() >= needed
-+
-     def resume_retracted_reqs(
-         self, rids_to_check: Optional[List[str]] = None
-     ) -> List[Req]:
-@@ -973,6 +1086,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-
-             if self.req_to_token_pool.available_size() <= 0:
-                 break
-+            if not self._ensure_mamba_prealloc_capacity(req):
-+                break
-
-             full_required, swa_required = self._prealloc_required_tokens(req)
-             if not self._prealloc_reservation_fits(
-@@ -1026,6 +1141,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-         rids_to_check: Optional[List[str]] = None,
-         pp_good_rids: Optional[List[str]] = None,
-         pp_bad_rids: Optional[List[str]] = None,
-+        pp_confirmed_aborts: Optional[set[str]] = None,
-     ) -> None:
-         if not self.queue:
-             return
-@@ -1051,7 +1167,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-                     decode_req.req.bootstrap_room,
-                     bootstrap_timeout,
-                 )
--                decode_req.kv_receiver.abort()
-+                decode_req.kv_receiver.abort("Decode handshake timed out.")
-
-         # Receiver polling observes asynchronous failures while KV allocation
-         # is blocked.
-@@ -1067,6 +1183,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-                 [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-             )
-
-+        if pp_confirmed_aborts is None:
-+            confirmed_aborts = _consensus_tokenizer_aborts(
-+                self.queue, polls, getattr(self, "gloo_group", None)
-+            )
-+        else:
-+            confirmed_aborts = pp_confirmed_aborts
-         for decode_req, poll in zip(self.queue, polls):
-             if poll is None:
-                 continue
-@@ -1081,22 +1203,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-                 decode_req.waiting_for_input = True
-                 decode_req.req.time_stats.set_bootstrap_done_time()
-             elif poll == KVPoll.Failed:
--                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
--                is_propagated = False
--                try:
--                    decode_req.kv_receiver.failure_exception()
--                except Exception as e:
--                    error_message += f" with exception {e}"
--                    is_propagated = getattr(e, "is_from_another_rank", False)
--                # Mute error message for propagated exceptions to avoid duplicate logging
--                if is_propagated:
--                    logger.debug(error_message)
--                else:
--                    logger.error(error_message)
--                prepare_abort(
--                    decode_req.req,
--                    error_message,
--                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-+                _finish_decode_kv_failure(
-+                    decode_req,
-+                    "handshake",
-+                    self.tp_rank,
-+                    confirmed_abort=decode_req.req.rid in confirmed_aborts,
-                 )
-                 if self.scheduler.metrics_reporter.enable_metrics:
-                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-@@ -1139,7 +1250,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-                 for decode_req in reqs:
-                     # kv_receiver may be None from a prior self.queue cleanup
-                     if decode_req.kv_receiver is not None:
--                        decode_req.kv_receiver.abort()
-+                        decode_req.kv_receiver.abort(error_msg)
-                 del self._ensure_retry_count[bootstrap_addr]
-                 del self._ensure_last_attempt_time[bootstrap_addr]
-             else:
-@@ -1260,6 +1371,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-         rids_to_check: Optional[List[str]] = None,
-         pp_good_rids: Optional[List[str]] = None,
-         pp_bad_rids: Optional[List[str]] = None,
-+        pp_confirmed_aborts: Optional[set[str]] = None,
-     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-         """Pop the preallocated requests from the pending queue (FIFO)."""
-         is_pp_mode = self.pp_size > 1
-@@ -1269,7 +1381,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-             raise ValueError("rids_to_check cannot be used in PP mode")
-
-         self._resolve_pending_reqs()
--        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
-+        self._update_handshake_waiters(
-+            rids_to_check, pp_good_rids, pp_bad_rids, pp_confirmed_aborts
-+        )
-         if is_pp_mode:
-             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
-
-@@ -1402,18 +1516,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
-             if self.req_to_token_pool.available_size() <= 0:
-                 break
-
--            # Hybrid models (e.g. K3 with KDA): guard against prealloc
--            # draining the mamba pool before the KV pool (would assert "Not
--            # enough space for mamba cache"). Evict a cached mamba slot from
--            # the radix tree first (only if it manages mamba states;
--            # ChunkCache.evict is a no-op), else stop.
--            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
--            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
--                supports_mamba = self.tree_cache.supports_mamba()
--                if supports_mamba and hasattr(self.tree_cache, "evict"):
--                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
--                if mamba_allocator.available_size() <= 0:
--                    break
-+            if not self._ensure_mamba_prealloc_capacity(decode_req.req):
-+                break
-
-             if hisparse_req_budget <= 0:
-                 break
-@@ -2640,7 +2744,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
-                 return
-         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-
--    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-+    def pop_transferred(
-+        self,
-+        rids_to_check: Optional[List[str]] = None,
-+        *,
-+        pp_failed_rids: Optional[set[str]] = None,
-+        pp_confirmed_aborts: Optional[set[str]] = None,
-+    ) -> List[Req]:
-         if not self.queue:
-             return []
-
-@@ -2658,6 +2768,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
-         else:
-             polls = self._poll_with_metadata_gate()
-
-+        if pp_confirmed_aborts is None:
-+            confirmed_aborts = _consensus_tokenizer_aborts(
-+                self.queue, polls, getattr(self, "gloo_group", None)
-+            )
-+        else:
-+            confirmed_aborts = pp_confirmed_aborts
-         transfer_timeout = float(
-             os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
-         )
-@@ -2672,33 +2788,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
-             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
-                 continue
-
-+            # A different PP stage can fail after this stage completed its KV transfer.
-+            # Leave a still-active local destination on the usual drain path.
-+            if (
-+                poll == KVPoll.Success
-+                and pp_failed_rids
-+                and decode_req.req.rid in pp_failed_rids
-+            ):
-+                poll = KVPoll.Failed
-+
-             hicache_restore_status = decode_req.hicache_restore_status
-             if (
-                 poll == KVPoll.Failed
-                 or hicache_restore_status == HiCacheRestoreResult.FAILED
-             ):
--                error_message = (
--                    f"Decode transfer failed for request rank={self.tp_rank} "
--                    f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-+                _finish_decode_kv_failure(
-+                    decode_req,
-+                    "transfer",
-+                    self.tp_rank,
-+                    poll == KVPoll.Failed,
-+                    confirmed_abort=decode_req.req.rid in confirmed_aborts,
-                 )
--                is_propagated = False
--                if poll == KVPoll.Failed:
--                    try:
--                        decode_req.kv_receiver.failure_exception()
--                    except Exception as e:
--                        error_message += f" with exception {e}"
--                        is_propagated = getattr(e, "is_from_another_rank", False)
-                 self._clean_hicache_prefetch_resources(decode_req)
--                # Mute error message for propagated exceptions to avoid duplicate logging
--                if is_propagated:
--                    logger.debug(error_message)
--                else:
--                    logger.error(error_message)
--                prepare_abort(
--                    decode_req.req,
--                    error_message,
--                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
--                )
-                 self.scheduler.output_streamer.stream_output(
-                     [decode_req.req],
-                     decode_req.req.return_logprob,
-@@ -2794,7 +2905,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
-                         decode_req.req.bootstrap_room,
-                         transfer_timeout,
-                     )
--                    decode_req.kv_receiver.abort()
-+                    decode_req.kv_receiver.abort("Decode transfer timed out.")
-             else:
-                 raise ValueError(f"Unexpected poll case: {poll}")
-
-@@ -2849,40 +2960,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
-         """Release drained transfers; device destinations may also time out."""
-         if not self._deferred_releases:
-             return
--        host_ready = torch.tensor(
--            [
--                req.kv_receiver.kv_mgr.is_abort_release_safe(
--                    req.req.bootstrap_room, acks
--                )
--                for req, _, _, acks in self._deferred_releases
--                if self.enable_host_receive and req.host_staged
--            ],
--            dtype=torch.int32,
--        )
--        if host_ready.numel() and torch.distributed.get_world_size(self.gloo_group) > 1:
--            # Admission must see identical host capacity and page order on every rank.
-+        now = time.monotonic()
-+        release_states = []
-+        for req, deadline, _, acks in self._deferred_releases:
-+            if req.kv_receiver.kv_mgr.is_abort_release_safe(
-+                req.req.bootstrap_room, acks
-+            ):
-+                state = 2  # Drained.
-+            elif not (self.enable_host_receive and req.host_staged) and now >= deadline:
-+                state = 1  # Device-only timeout fallback; host writes must drain.
-+            else:
-+                state = 0  # Keep the destination reserved.
-+            release_states.append(state)
-+        release_states = torch.tensor(release_states, dtype=torch.int32)
-+        if torch.distributed.get_world_size(self.gloo_group) > 1:
-+            # Device capacity and allocator order must agree too: a local ACK
-+            # must not let one rank admit a request while its peers keep polling.
-             torch.distributed.all_reduce(
--                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
-+                release_states, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
-             )
--        host_ready = iter(host_ready.tolist())
--        now = time.monotonic()
-         still_held = []
-         to_release = []
--        for decode_req, deadline, idx, required_acks in self._deferred_releases:
--            room = decode_req.req.bootstrap_room
--            if self.enable_host_receive and decode_req.host_staged:
--                if next(host_ready):
--                    to_release.append((decode_req, idx, room, True))
--                else:
--                    # A timeout cannot prove that a remote write has stopped.
--                    still_held.append((decode_req, deadline, idx, required_acks))
--                continue
--            kv_mgr = decode_req.kv_receiver.kv_mgr
--            drained = kv_mgr.is_abort_release_safe(room, required_acks)
--            if not drained and now < deadline:
--                still_held.append((decode_req, deadline, idx, required_acks))
-+        for entry, state in zip(self._deferred_releases, release_states.tolist()):
-+            decode_req, deadline, idx, required_acks = entry
-+            if state == 0:
-+                still_held.append(entry)
-             else:
--                to_release.append((decode_req, idx, room, drained))
-+                to_release.append(
-+                    (decode_req, idx, decode_req.req.bootstrap_room, state == 2)
-+                )
-         # Commit the survivors before releasing so a _do_release exception can't
-         # leave a released entry in the list (double-free / None receiver on retry).
-         self._deferred_releases = still_held
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
@@ -12437,42 +12801,6 @@ diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/manager
 
      def __post_init__(self):
          # FIXME: This is a hack to keep the same with the old code
-diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
---- a/python/sglang/srt/managers/scheduler.py
-+++ b/python/sglang/srt/managers/scheduler.py
-@@ -5555,7 +5555,7 @@
-             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
--                    decode_req.kv_receiver.abort()
-+                    decode_req.abort_kv(recv_req)
-                     if get_parallel().pp_size > 1:
-                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
-
-@@ -5565,12 +5565,21 @@
-                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                     if decode_req.host_staged:
-                         # Keep the host destination alive until prefill stops writing.
--                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-+                        req = decode_req.req
-+                        if req.finished_reason is None:
-+                            if recv_req.is_tokenizer_abort_for(req.rid):
-+                                prepare_abort(
-+                                    req,
-+                                    f"Request {req.rid} was aborted",
-+                                    status_code=499,
-+                                )
-+                            else:
-+                                prepare_abort(req, "Aborted by AbortReq.")
-                         continue
-                     # The receiver arms drain-ack accounting before sending the
-                     # ABORT (see CommonKVReceiver._send_abort_notification), so
-                     # an ack racing back is never dropped.
--                    decode_req.kv_receiver.abort()
-+                    decode_req.abort_kv(recv_req)
-
-             # Abort requests whose KV is already backed up for retraction.
-             if self.disagg_decode_prealloc_queue.retracted_queue:
 diff --git a/python/sglang/srt/managers/scheduler_pp_mixin.py b/python/sglang/srt/managers/scheduler_pp_mixin.py
 --- a/python/sglang/srt/managers/scheduler_pp_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_pp_mixin.py

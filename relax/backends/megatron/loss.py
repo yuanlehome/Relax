@@ -471,9 +471,10 @@ def get_log_probs_and_entropy(
         lm_head_forward: If set, ``logits`` is actually hidden_states; we defer
             the lm_head into this loss path and chunk the matmul at
             ``args.sft_logits_chunk_size`` so the full ``[B, S, V/TP]`` logits
-            never materialize (SFT chunked path). Requires ``with_entropy=False``
-            and ``with_topk=False`` — chunked path has no full-vocab tensor to
-            derive entropy/top-k from.
+            never materialize. SFT requires ``with_entropy=False`` and
+            ``with_topk=False``. Score centering uses ``args.log_probs_chunk_size``
+            and supports entropy plus scoring saved candidate IDs; collecting
+            new per-rank top-k indices is unsupported.
 
     Returns:
         Tuple of:
@@ -507,7 +508,7 @@ def get_log_probs_and_entropy(
             dynamic_cp_size=dynamic_cp_size,
             dynamic_cp_rank=dynamic_cp_rank,
         )
-    if lm_head_forward is not None:
+    if lm_head_forward is not None and not is_score_centering:
         assert not with_entropy and not with_topk, (
             "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
         )
@@ -545,7 +546,10 @@ def get_log_probs_and_entropy(
         dynamic_cp_rank=dynamic_cp_rank,
     )
     if is_score_centering:
-        with torch.no_grad():
+        if lm_head_forward is None:
+            with torch.no_grad():
+                response_views = list(responses)
+        else:
             response_views = list(responses)
         res = get_score_centering_batch(
             logits,
@@ -556,6 +560,7 @@ def get_log_probs_and_entropy(
             with_entropy=with_entropy,
             with_topk=with_topk,
             topk_k=resolved_topk_k,
+            lm_head_forward=lm_head_forward,
         )
     elif lm_head_forward is not None:
         res = {"log_probs": []}
@@ -1006,6 +1011,7 @@ def policy_loss_function(
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
     *,
     reentrant_checkpoint: bool = False,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/SAPO) and metrics.
 
@@ -1045,6 +1051,11 @@ def policy_loss_function(
     algorithm = get_algorithm(args.advantage_estimator)
     is_token_global = algorithm.advantage_normalization == "token_global"
     is_score_centering = algorithm.policy_loss_fn == "score_centering"
+    if is_score_centering:
+        # Checkpoint replay must not mutate the CPU-resident batch or retain GPU tables.
+        batch = batch.copy()
+        for key in ("rollout_topk_token_ids", "rollout_topk_log_probs"):
+            batch[key] = [row.to(logits.device) for row in batch[key]]
 
     if is_token_global:
         sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
@@ -1077,6 +1088,7 @@ def policy_loss_function(
         cp_output_is_zigzag=batch.get("cp_output_is_zigzag", False),
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        lm_head_forward=lm_head_forward,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1860,6 +1872,11 @@ def _compute_loss_and_metrics(
     else:
         match args.loss_type:
             case "policy_loss":
+                if lm_head_forward is not None and args.advantage_estimator == "score_centering":
+                    # Each bounded head projection and score calculation share a checkpoint.
+                    return policy_loss_function(
+                        args, batch, logits, sum_of_sample_mean, lm_head_forward=lm_head_forward
+                    )
                 func = policy_loss_function
             case "value_loss":
                 func = value_loss_function

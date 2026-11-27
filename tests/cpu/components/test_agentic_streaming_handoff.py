@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Exercise streaming handoff with the real TQ controller and sampler, no cluster."""
+"""Exercise streaming handoff with the real TQ controller and sampler, no
+cluster."""
 
 import pickle
 from argparse import Namespace

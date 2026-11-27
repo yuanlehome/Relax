@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from tensordict import TensorDict
+from torch.utils._pytree import tree_map
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
@@ -548,6 +549,64 @@ def _replay_values_and_offsets(field_data: torch.Tensor, field_name: str) -> tup
     return values.contiguous(), offsets.contiguous()
 
 
+_SCORE_TOPK_FIELDS = ("rollout_topk_token_ids", "rollout_topk_log_probs")
+_TOPK_BROADCAST_BYTES = 64 * 1024 * 1024
+
+
+def _pack_topk_field(field: torch.Tensor | list, default_dtype: torch.dtype) -> tuple[torch.Tensor, list[torch.Size]]:
+    """Keep packed CPU storage when TransferQueue returns contiguous jagged
+    rows."""
+    if not isinstance(field, torch.Tensor):
+        rows = [torch.as_tensor(row, device="cpu") for row in field]
+        values = torch.cat([row.reshape(-1) for row in rows]) if rows else torch.empty(0, dtype=default_dtype)
+        return values, [row.shape for row in rows]
+    rows = field.unbind(0)
+    shapes = [row.shape for row in rows]
+    if not field.is_nested:
+        return field.detach().to("cpu").reshape(-1), shapes
+    if field.is_contiguous() and getattr(field, "_ragged_idx", 1) == 1:
+        values = field.values()
+        if values.numel() == sum(shape.numel() for shape in shapes):
+            return values.detach().to("cpu").reshape(-1), shapes
+    # Views with holes or a nonstandard ragged axis need logical row order.
+    return torch.cat([row.detach().to("cpu").reshape(-1) for row in rows]), shapes
+
+
+def _broadcast_topk_rows(
+    source: torch.Tensor | None,
+    dtype: torch.dtype,
+    shapes: list[torch.Size],
+    cuda_dev: torch.device,
+    broadcast_pp: bool,
+) -> list[torch.Tensor]:
+    """Send each chunk from CP0 to CP peers, across PP, then to local TP
+    peers."""
+    tp0 = mpu.get_tensor_model_parallel_rank() == 0
+    pp_source = not broadcast_pp or mpu.get_pipeline_model_parallel_rank() == 0
+    groups = []
+    if tp0 and pp_source and mpu.get_context_parallel_world_size() > 1:
+        groups.append(mpu.get_context_parallel_group())
+    if tp0 and broadcast_pp and mpu.get_pipeline_model_parallel_world_size() > 1:
+        groups.append(mpu.get_pipeline_model_parallel_group())
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        groups.append(mpu.get_tensor_model_parallel_group())
+
+    sizes = [shape.numel() for shape in shapes]
+    flat = source if source is not None else torch.empty(sum(sizes), dtype=dtype, device="cpu")
+    if groups and flat.numel():
+        chunk_size = max(1, _TOPK_BROADCAST_BYTES // flat.element_size())
+        staging = torch.empty(min(chunk_size, flat.numel()), dtype=dtype, device=cuda_dev)
+        for host_chunk in flat.split(chunk_size):
+            chunk = staging[: host_chunk.numel()]
+            if source is not None:
+                chunk.copy_(host_chunk)
+            for group in groups:
+                dist.broadcast(chunk, src=dist.get_global_rank(group, 0), group=group)
+            if source is None:
+                host_chunk.copy_(chunk)
+    return [row.view(shape) for row, shape in zip(flat.split(sizes), shapes, strict=True)]
+
+
 def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
     """Broadcast a single tensor of *known* dtype/shape across CP, TP, then
     PP."""
@@ -995,6 +1054,30 @@ def get_data_from_transfer_queue(
     if has_indexer_topk:
         rollout_data.append(indexer_topk_extract_error)
 
+    stream_topk = not per_rank_fetch and any(key in data_fields for key in _SCORE_TOPK_FIELDS)
+    topk_sources = {}
+    if stream_topk:
+        topk_spec, topk_error = {}, None
+        td = rollout_data[0]
+        if should_fetch and td is not None:
+            try:
+                for key in _SCORE_TOPK_FIELDS:
+                    if key in td.keys():
+                        dtype = torch.int32 if key == "rollout_topk_token_ids" else torch.float32
+                        flat, shapes = _pack_topk_field(td[key], dtype)
+                        topk_sources[key] = flat
+                        topk_spec[key] = (flat.dtype, shapes)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                topk_error = str(exc)
+            # Never pickle the tables, including when reporting a malformed source.
+            keys = [key for key in _SCORE_TOPK_FIELDS if key in td.keys()]
+            if keys:
+                if isinstance(td, TensorDict):
+                    rollout_data[0] = td.exclude(*keys)
+                else:
+                    rollout_data[0] = {key: value for key, value in td.items() if key not in keys}
+        rollout_data.append((topk_spec, topk_error))
+
     if per_rank_fetch:
         # Cheap byte-only diagnostic; never pickles (that would defeat the
         # whole point of per_rank_fetch).
@@ -1035,6 +1118,10 @@ def get_data_from_transfer_queue(
 
     # Unpack the broadcasted metadata and surface extraction failures on every
     # rank only after the object collective has completed.
+    if stream_topk:
+        topk_spec, topk_error = rollout_data.pop()
+        if topk_error is not None:
+            raise RuntimeError(f"Unable to transfer Score Centering Top-K rows: {topk_error}")
     indexer_topk_extract_error = rollout_data[3] if has_indexer_topk else None
     rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
 
@@ -1132,6 +1219,11 @@ def get_data_from_transfer_queue(
                 raise TypeError(f"Unsupported rollout_data type for key '{k}': {type(v)}")
 
         rollout_data = new_rollout_data
+
+    if stream_topk:
+        with timer("tgd_bcast_score_topk"):
+            for key, (dtype, shapes) in topk_spec.items():
+                rollout_data[key] = _broadcast_topk_rows(topk_sources.get(key), dtype, shapes, cuda_dev, broadcast_pp)
 
     # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
     # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
@@ -1265,12 +1357,12 @@ def post_process_rollout_data(args, rollout_data):
     ]
     response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
     response_field_dtypes["rollout_topk_support_complete"] = torch.bool
-    for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
+    # Keep SC tables on CPU through packing/CP slicing; only the loss stage uploads them.
+    topk_dtypes = {"rollout_topk_token_ids": torch.long, "rollout_topk_log_probs": torch.float32}
+    for key, dtype in topk_dtypes.items():
         if key in rollout_data:
             rollout_data[key] = [
-                torch.as_tensor(row, device=cuda_dev, dtype=dtype).reshape(
-                    response_length, args.rollout_top_logprobs_num
-                )
+                torch.as_tensor(row, device="cpu", dtype=dtype).reshape(response_length, args.rollout_top_logprobs_num)
                 for row, response_length in zip(rollout_data[key], rollout_data["response_lengths"], strict=True)
             ]
             response_field_dtypes[key] = dtype
@@ -1285,6 +1377,7 @@ def post_process_rollout_data(args, rollout_data):
     for key, dtype in response_field_dtypes.items():
         if key not in rollout_data:
             continue
+        field_device = "cpu" if key in topk_dtypes else cuda_dev
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
         # Each micro-batch picks its own CP size at train time and get_batch
         # re-slices these fields per-mb (data.py dynamic-CP reslice); log_rollout_data
@@ -1294,7 +1387,7 @@ def post_process_rollout_data(args, rollout_data):
         # forward, but rollout_log_probs is not, so it would reach logging CP-split.
         if getattr(args, "dynamic_context_parallel", False):
             rollout_data[key] = [
-                torch.as_tensor(log_prob, device=cuda_dev, dtype=dtype) for log_prob in rollout_data[key]
+                torch.as_tensor(log_prob, device=field_device, dtype=dtype) for log_prob in rollout_data[key]
             ]
             continue
         rollout_data[key] = [
@@ -1307,7 +1400,7 @@ def post_process_rollout_data(args, rollout_data):
                     rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
                     padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
                 ),
-                device=cuda_dev,
+                device=field_device,
                 dtype=dtype,
             )
             for i, (log_prob, total_length, response_length) in enumerate(
@@ -1440,6 +1533,8 @@ class StreamingTQIterator:
         # Buffer of (batch_dict, meta) tuples — populated by __next__ so that
         # get_buffer() can be used for end-of-rollout logging (mirrors MicroBatchListIterator).
         self._buffer: List[Tuple[Dict[str, Any], Any]] = []
+        # Train-only dummy template: retain at most the latest device batch.
+        self._last_real_batch: Optional[Tuple[Dict[str, Any], Any]] = None
 
         # ── cross-DP micro-batch alignment (dummy padding) ───────────────
         # With dynamic batch + DP>1, each DP packs a different number of
@@ -1543,7 +1638,8 @@ class StreamingTQIterator:
         """Build a dummy micro-batch from the last real one, tagged so the loss
         contributes zero gradient (keeps all DP ranks at the same micro-batch
         count)."""
-        if not self._buffer:
+        template = self._last_real_batch if self.per_round_dummy else (self._buffer[-1] if self._buffer else None)
+        if template is None:
             # A dp asked to emit a dummy before ever seeing a real batch = it got
             # ZERO samples this window. With the fair per-window quota
             # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
@@ -1554,7 +1650,7 @@ class StreamingTQIterator:
                 f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
                 "this window (no template to build a dummy from)."
             )
-        data, meta = self._buffer[-1]
+        data, meta = template
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
@@ -1629,7 +1725,18 @@ class StreamingTQIterator:
         # straddles a window boundary — no consumer-side split/spill needed.
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
-        self._buffer.append((data, meta))
+        if self.per_round_dummy:
+            # Logging spans the whole window; keep its history off the accelerator.
+            # Copy CPU tensors too so later mutations cannot change recorded rows.
+            log_data = tree_map(
+                lambda value: value.detach().to(device="cpu", copy=True) if isinstance(value, torch.Tensor) else value,
+                data,
+            )
+            self._buffer.append((log_data, meta))
+            self._last_real_batch = (data, meta)
+        else:
+            # Forward-only consumers retain the existing log-prob/replay behavior.
+            self._buffer.append((data, meta))
         self._batch_index += 1
         self._mb_count += 1
 
@@ -1637,10 +1744,13 @@ class StreamingTQIterator:
         if "advantages" in data:
             advs = data["advantages"]
             if isinstance(advs, list) and len(advs) > 0:
-                adv_vals = [a.float().mean().item() if hasattr(a, "mean") else float(a) for a in advs]
-                adv_info = (
-                    f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
-                )
+                adv_vals = [
+                    "empty"
+                    if isinstance(a, torch.Tensor) and a.numel() == 0
+                    else f"{a.float().mean().item() if hasattr(a, 'mean') else float(a):.4f}"
+                    for a in advs
+                ]
+                adv_info = f" adv_means=[{','.join(adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
         # ``samples`` reports GLOBAL window progress (sum across all dps) vs the
         # window quota, so it monotonically approaches ``window_quota`` (e.g.
         # 256).  The controller piggybacks this global count on the fetched
@@ -1729,6 +1839,7 @@ class StreamingTQIterator:
                     return self._emit_dummy_batch()
                 if extra.get("stream_end"):
                     self._shutdown_prefetch()
+                    self._last_real_batch = None
                     raise StopIteration
             else:
                 # Forward-only / legacy path: end-phase dummy-pad via all_reduce

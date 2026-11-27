@@ -273,26 +273,31 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, fai
                 observation.token_count_complete = False
             retry_count += 1
 
+            status_code = None
             if isinstance(e, httpx.HTTPStatusError):
-                response_text = e.response.text
                 status_code = e.response.status_code
                 if fail_fast_no_workers and is_router_no_available_workers(e):
                     raise
                 is_retryable_http_error = status_code >= 500 or status_code in {408, 409, 425, 429}
                 if not is_retryable_http_error:
                     logger.info(
-                        f"Error: {e}, not retrying non-retryable HTTP status "
-                        f"(url={url}, status_code={status_code}, response={response_text})"
+                        "HTTP POST failed error_type=%s status_code=%s attempt=%s max_attempts=%s retryable=False",
+                        type(e).__name__,
+                        status_code,
+                        retry_count,
+                        max_retries,
                     )
                     raise
-            else:
-                response_text = None
 
             logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+                "HTTP POST failed error_type=%s status_code=%s attempt=%s max_attempts=%s",
+                type(e).__name__,
+                status_code,
+                retry_count,
+                max_retries,
             )
             if retry_count >= max_retries:
-                logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+                logger.info("HTTP POST max attempts reached max_attempts=%s", max_retries)
                 raise e
             await asyncio.sleep(1)
             continue

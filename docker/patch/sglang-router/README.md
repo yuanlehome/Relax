@@ -73,3 +73,39 @@ Remove a physical worker using its registration UUID so all its virtual ranks
 are removed together. Stable decode routing alone does not prove prefill
 affinity or CPU cache restoration. `X-SMG-Target-Worker` overrides the hashing
 policy; use separate requests without this header to validate session affinity.
+
+## PD failure and RID lifetime
+
+Once dual dispatch starts, the router never transparently replays that request,
+including after a 5xx response, transport error, or confirmed cancellation.
+Retries remain available for worker selection failures before dispatch. This
+does not change RID collision checks or session-key routing to decode DP owners.
+
+A P/D failure triggers targeted sibling aborts while the router continues to
+await the sibling's original response. Repeated aborts cover late registration.
+An abort HTTP acknowledgement is not terminal proof, and outstanding abort
+controls are joined before returning. Cleanup has a 30-second deadline plus a
+final one-second best-effort abort. Transport failures also trigger a best-effort
+abort of the uncertain origin; its termination cannot be inferred from that ACK.
+
+Ordinary HTTP/transport failures retain their original status and error even
+when cleanup fails. Such responses include
+`X-SGLang-PD-Cleanup: unconfirmed` when remote termination is not established.
+Exact native cancellation still returns 499 only after sibling settlement;
+unconfirmed cancellation retains the existing 424
+`pd_cancellation_unconfirmed` response. No automatic replay follows either.
+
+CPU regression tests run the actual native router with five retry attempts
+configured, two DP ranks per worker, and session-key affinity:
+
+```bash
+python -m pytest \
+  tests/cpu/backends/sglang/test_pd_failure_cleanup_router.py \
+  tests/cpu/backends/sglang/test_pd_routing_replay_router.py \
+  tests/cpu/backends/sglang/test_managed_request_lifecycle.py
+```
+
+They inject duplicate-RID rejection, P/D transport failures, truncated response
+bodies, delayed registration, delayed terminal responses and abort ACK races.
+Use an isolated build on `PYTHONPATH`; running these tests against an older
+installed router is a negative control, not verification of the source patch.

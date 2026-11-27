@@ -66,6 +66,26 @@ logger = get_logger(__name__)
 _CLEANUP_GRACE_S = 5.0
 
 
+def _http_failure_metadata(error: httpx.HTTPStatusError) -> tuple[str, str]:
+    """Keep only bounded, protocol-owned fields from an untrusted error
+    body."""
+    cleanup = "unknown"
+    code = "unknown"
+    try:
+        if error.response.headers.get("x-sglang-pd-cleanup") == "unconfirmed":
+            cleanup = "unconfirmed"
+        if len(error.response.content) <= 16384:
+            body = error.response.json()
+            detail = body.get("error") if isinstance(body, dict) else None
+            value = detail.get("code") if isinstance(detail, dict) else None
+            if value in ("decode_server_error", "prefill_internal_error", "no_available_workers"):
+                code = value
+    except Exception:
+        # Diagnostics must not replace the original HTTP error.
+        pass
+    return cleanup, code
+
+
 # Compiler calibration messages used to measure the chat-template prefix. Their
 # exact roles and text affect prefix subtraction, so changes require tokenizer
 # and template coverage rather than cosmetic editing.
@@ -678,6 +698,19 @@ class SGLangBackendAdapter:
             if recorder is not None:
                 recorder.record_exception(capture_seq, error, elapsed_s=time.monotonic() - started)
             aborted = is_expected_sglang_499(error)
+            if not aborted:
+                pd_cleanup, backend_code = _http_failure_metadata(error)
+                logger.warning(
+                    "Agentic HTTP generation failed session_id=%s backend_request_id=%s wire_rid=%s "
+                    "http_status=%s error_type=%s backend_code=%s pd_cleanup=%s",
+                    session_id,
+                    request_id,
+                    attempt.wire_id,
+                    error.response.status_code,
+                    type(error).__name__,
+                    backend_code,
+                    pd_cleanup,
+                )
             if aborted or error.response.status_code == 400:
                 self._requests.pop(request_id, None)
             if _is_context_length_error(error):
@@ -787,29 +820,104 @@ class SGLangBackendAdapter:
                 pass
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
-        """Release one terminal Session from every engine radix cache."""
+        """Confirm control delivery, retrying unconfirmed targets in three
+        bounded windows.
 
+        Each window includes discovery and POSTs. An HTTP success is not proof
+        that scheduler/cache cleanup has completed.
+        """
         if not self._session_lifecycle:
             self._session_endpoints.pop(session_id, None)
             return True
 
-        async def close_all_workers() -> list[Any]:
-            urls = self._session_endpoints.get(session_id) or await self._worker_urls()
-            if not urls:
-                raise RuntimeError("Cannot close a backend session without any worker targets")
-            return await asyncio.gather(
-                *(post(f"{url}/close_session", {"session_id": session_id}, client=self._managed_http) for url in urls),
-                return_exceptions=True,
-            )
+        pending = set(self._session_endpoints.get(session_id) or ()) or None
+        outcomes: dict[str, dict[str, Any]] = {}
+
+        def endpoint(url: str) -> str:
+            try:
+                parsed = httpx.URL(url)
+                return f"{parsed.scheme}://{parsed.host}:{parsed.port}"
+            except Exception:
+                return "<invalid-worker-url>"
+
+        async def close_target(url: str) -> None:
+            key = endpoint(url)
+            try:
+                await post(
+                    f"{url}/close_session",
+                    {"session_id": session_id},
+                    max_retries=1,
+                    client=self._managed_http,
+                )
+            except Exception as error:
+                outcomes[key] = {
+                    "control_ack": "unknown",
+                    "error_type": type(error).__name__,
+                    "http_status": (error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None),
+                }
+            else:
+                # Save individual ACKs before waiting for slower peers.
+                outcomes[key] = {"control_ack": "http_success"}
+                pending.discard(url)
+
+        async def close_window() -> None:
+            nonlocal pending
+            if pending is None:
+                urls = await self._worker_urls()
+                if not urls:
+                    raise RuntimeError("Cannot close a backend session without any worker targets")
+                pending = set(urls)
+            for url in pending:
+                outcomes[endpoint(url)] = {"control_ack": "unknown", "error_type": None, "http_status": None}
+            tasks = [asyncio.create_task(close_target(url)) for url in sorted(pending)]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
-            outcomes = await asyncio.wait_for(close_all_workers(), timeout=timeout_s)
-        except Exception:
+            for attempt in range(1, 4):
+                started = time.monotonic()
+                stage = "discovery" if pending is None else "targets"
+                error_type = None
+                try:
+                    await asyncio.wait_for(close_window(), timeout=timeout_s)
+                except Exception as error:
+                    error_type = type(error).__name__
+                if pending is not None:
+                    stage = "targets"
+                    for url in pending:
+                        key = endpoint(url)
+                        if error_type is not None and outcomes.get(key, {}).get("error_type") is None:
+                            outcomes[key] = {"control_ack": "unknown", "error_type": error_type, "http_status": None}
+                if pending is not None and not pending:
+                    if attempt > 1:
+                        logger.info(
+                            "Backend session close control recovered session_id=%s attempt=%d targets=%s",
+                            session_id,
+                            attempt,
+                            outcomes,
+                        )
+                    return True
+                logger.warning(
+                    "Backend session close control unconfirmed session_id=%s attempt=%d/3 stage=%s "
+                    "elapsed_s=%.3f error_type=%s targets=%s",
+                    session_id,
+                    attempt,
+                    stage,
+                    time.monotonic() - started,
+                    error_type,
+                    outcomes,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(0.25)
             return False
         finally:
-            # Cache-close completion is not acknowledgement of a request abort.
+            # Keep request-abort and physical process receipts independent.
             self._session_endpoints.pop(session_id, None)
-        return all(not isinstance(outcome, BaseException) for outcome in outcomes)
 
     async def _worker_urls(self) -> list[str]:
         """Include unhealthy workers: health is not proof that a request
@@ -994,6 +1102,7 @@ class RuntimeGroupStream:
     eager_session_generation: bool = False
     preparation_task: Optional["asyncio.Task[None]"] = None
     closing: bool = False
+    runtime_admitted: bool = False
 
 
 def agentic_eval_concurrency_from_args(args: Namespace, eval_group_size: int) -> int:
@@ -1109,6 +1218,17 @@ class RuntimeDomain:
         """Derive Runtime residency from Shard group capabilities."""
 
         return sum(len(shard.group_streams) for shard in self._shards)
+
+    @property
+    def runtime_group_count(self) -> int:
+        """Count admitted unfinished groups, excluding Prepare and Reward."""
+        return sum(
+            stream.runtime_admitted
+            and not stream.closing
+            and not all(result.completion.done() for result in stream.session_results)
+            for shard in self._shards
+            for stream in shard.group_streams.values()
+        )
 
     async def bind_router(self, router_ip: str, router_port: int) -> None:
         """Wait until all Session owners can use the verified endpoint."""
@@ -1418,6 +1538,8 @@ class RuntimeDomain:
                 if stream.preparation_task is not None and stream.preparation_task.done():
                     stream.preparation_task.result()
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
+            stream.runtime_admitted = True
+            self._progress_callback()
         except BaseException:
             await finish_before_cancellation(
                 self.drop_group(stream),
@@ -1625,6 +1747,7 @@ class RuntimeDomain:
                     self._schedule_group_cleanup(stream, drop=True)
                 raise
             self._schedule_group_cleanup(stream, drop=False)
+            self._progress_callback()
             return group
         except BaseException:
             await finish_before_cancellation(

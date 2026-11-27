@@ -1762,6 +1762,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--agentic-runtime-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Opt-in steady Runtime group target for fully asynchronous agentic rollout. "
+                    "Prepare and completed groups do not count toward this target."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-prepare-groups",
+                type=int,
+                default=16,
+                help="Maximum Prepare groups with --agentic-runtime-groups (default: 16).",
+            )
+            parser.add_argument(
                 "--agentic-eval-concurrency",
                 type=int,
                 default=None,
@@ -3626,6 +3641,17 @@ def _validate_agentic_rollout_args(args) -> None:
             raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
         if key.startswith("RELAX_"):
             raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
+    runtime_groups = getattr(args, "agentic_runtime_groups", None)
+    if runtime_groups is not None:
+        prepare_groups = getattr(args, "agentic_prepare_groups", 16)
+        if runtime_groups <= 0 or prepare_groups <= 0:
+            raise ValueError("--agentic-runtime-groups and --agentic-prepare-groups must be > 0.")
+        if not args.fully_async or args.use_dynamic_global_batch_size:
+            raise ValueError("--agentic-runtime-groups requires fully async rollout with fixed global batch size.")
+        if args.agentic_concurrency is None:
+            args.agentic_concurrency = runtime_groups + prepare_groups
+        if runtime_groups + prepare_groups > args.agentic_concurrency:
+            raise ValueError("Runtime target plus Prepare allowance must fit --agentic-concurrency.")
     if args.agentic_concurrency is not None and args.agentic_concurrency <= 0:
         raise ValueError("--agentic-concurrency must be > 0.")
     if args.agentic_eval_concurrency is not None and args.agentic_eval_concurrency <= 0:

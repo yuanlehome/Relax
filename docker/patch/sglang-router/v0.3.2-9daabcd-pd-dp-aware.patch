@@ -1,11 +1,10 @@
 diff --git a/src/app_context.rs b/src/app_context.rs
-index c429162..7c16e07 100644
 --- a/src/app_context.rs
 +++ b/src/app_context.rs
-@@ -328,8 +328,11 @@ impl AppContextBuilder {
+@@ -328,13 +328,24 @@
          // backend to avoid unnecessary TLS initialization overhead.
          let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
- 
+
 +        // Retire PD connections before SGLang's default five-second keep-alive.
 +        // Reusing a closing prefill connection can leave decode waiting for KV.
 +        let pool_idle_secs = if config.mode.is_pd_mode() { 4 } else { 50 };
@@ -15,6 +14,19 @@ index c429162..7c16e07 100644
              .pool_max_idle_per_host(500)
              .timeout(Duration::from_secs(timeout_secs))
              .connect_timeout(Duration::from_secs(10))
+             .tcp_nodelay(true)
+             .tcp_keepalive(Some(Duration::from_secs(30)));
++
++        // reqwest defaults TCP_USER_TIMEOUT to 30 seconds. Do not let that
++        // implicit transport deadline abort long requests under backpressure.
++        // Retain the system TCP liveness policy and the configured HTTP deadline.
++        #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
++        {
++            client_builder = client_builder.tcp_user_timeout(None);
++        }
+
+         // Force rustls backend when TLS is configured
+         if has_tls_config {
 diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
 index 9b55e31..36cfb45 100644
 --- a/src/core/worker_builder.rs
@@ -103,7 +115,6 @@ index 3f31b6f..b2c9b08 100644
 +}
 +
 diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
-index 568894f..a2b2e0c 100644
 --- a/src/routers/http/pd_router.rs
 +++ b/src/routers/http/pd_router.rs
 @@ -1,4 +1,8 @@
@@ -113,10 +124,10 @@ index 568894f..a2b2e0c 100644
 +    sync::Arc,
 +    time::{Duration, Instant},
 +};
- 
+
  use async_trait::async_trait;
  use axum::{
-@@ -10,16 +14,16 @@ use axum::{
+@@ -10,16 +14,16 @@
      },
      response::{IntoResponse, Response},
  };
@@ -129,22 +140,74 @@ index 568894f..a2b2e0c 100644
  use serde_json::{json, Value};
  use tokio_stream::wrappers::UnboundedReceiverStream;
  use tracing::{debug, error, warn};
- 
+
 -use super::pd_types::api_path;
 +use super::{pd_routing, pd_types::api_path};
  use crate::{
      config::types::RetryConfig,
      core::{
-@@ -76,7 +80,7 @@ impl PDRouter {
+@@ -48,6 +52,11 @@
+     },
+ };
+
++// Once either side may have received a request, retrying the RID is unsafe.
++// This marker also covers transport failures and unconfirmed cancellation.
++#[derive(Clone, Copy, Debug)]
++struct PDDispatched;
++
+ #[derive(Debug)]
+ pub struct PDRouter {
+     pub worker_registry: Arc<WorkerRegistry>,
+@@ -76,7 +85,7 @@
          headers: Option<Vec<(String, String)>>,
      ) -> Response {
          let workers = self.worker_registry.get_prefill_workers();
 -        let first_worker_url = workers.first().map(|w| w.url().to_string());
 +        let first_worker_url = workers.first().map(|w| w.base_url().to_string());
- 
+
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -480,6 +484,7 @@ impl PDRouter {
+@@ -368,7 +377,7 @@
+                             Err(e) => return Self::handle_serialization_error(e),
+                         };
+
+-                        let response = self
++                        let mut response = self
+                             .execute_dual_dispatch_internal(
+                                 headers,
+                                 json_request,
+@@ -378,6 +387,7 @@
+                                 start_time,
+                             )
+                             .await;
++                        response.extensions_mut().insert(PDDispatched);
+
+                         let status = response.status();
+                         let not_error = status.is_success() || status.is_client_error();
+@@ -403,7 +413,10 @@
+                     }
+                 }
+             },
+-            |res, _attempt| is_retryable_status(res.status()),
++            |res, _attempt| {
++                res.extensions().get::<PDDispatched>().is_none()
++                    && is_retryable_status(res.status())
++            },
+             |delay, attempt| {
+                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
+                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+@@ -428,7 +441,9 @@
+                 endpoint,
+                 duration,
+             );
+-        } else if !is_retryable_status(response.status()) {
++        } else if response.extensions().get::<PDDispatched>().is_some()
++            || !is_retryable_status(response.status())
++        {
+             Metrics::record_router_error(
+                 metrics_labels::ROUTER_HTTP,
+                 metrics_labels::BACKEND_PD,
+@@ -480,6 +495,7 @@
                  None,
                  context.return_logprob,
                  false,
@@ -152,10 +215,10 @@ index 568894f..a2b2e0c 100644
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +562,233 @@ impl PDRouter {
+@@ -557,6 +573,513 @@
          }
      }
- 
+
 +    // Keep physical endpoints separate from virtual DP identities. Preserve the raw
 +    // request so native extensions such as routed_experts survive the round trip.
 +    fn prepare_dp_requests(
@@ -270,6 +333,7 @@ index 568894f..a2b2e0c 100644
 +        let outcomes = futures_util::future::join_all(rids.iter().map(|rid| async move {
 +            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 +            if remaining.is_zero() {
++                warn!(peer = peer.url(), rid, "PD abort deadline expired before dispatch");
 +                return false;
 +            }
 +            let attempt = async {
@@ -289,7 +353,7 @@ index 568894f..a2b2e0c 100644
 +                    Ok(response) if response.status().is_success() => match response.bytes().await {
 +                        Ok(_) => true,
 +                        Err(error) => {
-+                            warn!(peer = peer.url(), rid, %error, "PD sibling abort response failed");
++                            warn!(peer = peer.url(), rid, error_source = ?std::error::Error::source(&error), is_timeout = error.is_timeout(), is_body = error.is_body(), "PD sibling abort response failed");
 +                            false
 +                        }
 +                    },
@@ -298,7 +362,7 @@ index 568894f..a2b2e0c 100644
 +                        false
 +                    }
 +                    Err(error) => {
-+                        warn!(peer = peer.url(), rid, %error, "PD sibling abort request failed");
++                        warn!(peer = peer.url(), rid, error_source = ?std::error::Error::source(&error), is_connect = error.is_connect(), is_timeout = error.is_timeout(), "PD sibling abort request failed");
 +                        false
 +                    }
 +                }
@@ -369,6 +433,13 @@ index 568894f..a2b2e0c 100644
 +                },
 +            }
 +        }
++        warn!(
++            peer = peer.url(),
++            ?rids,
++            deadline_ms = deadline.as_millis(),
++            aborts_acknowledged = aborts_confirmed,
++            "PD sibling response did not settle before cleanup deadline"
++        );
 +        // In-flight controls use the same deadline. Only this final explicit
 +        // best-effort abort gets one additional second; it cannot prove release.
 +        self.abort_pd_peer(
@@ -383,13 +454,285 @@ index 568894f..a2b2e0c 100644
 +        ))
 +    }
 +
++    fn mark_cleanup_unconfirmed(mut response: Response, reason: &'static str) -> Response {
++        warn!(reason, status = %response.status(), "PD cleanup is unconfirmed; preserving original error without replay");
++        response.headers_mut().insert(
++            "x-sglang-pd-cleanup",
++            HeaderValue::from_static("unconfirmed"),
++        );
++        response
++    }
++
++    // An interrupted response cannot prove that its own remote request ended.
++    // Abort that side as well, but only the original sibling response (not an
++    // abort ACK) can confirm sibling completion.
++    async fn settle_failed_peer<F, T>(
++        &self,
++        future: F,
++        peer: &dyn Worker,
++        uncertain_origin: Option<&dyn Worker>,
++        rids: &[&str],
++        headers: Option<&HeaderMap>,
++    ) -> Result<T, Response>
++    where
++        F: Future<Output = T>,
++    {
++        let deadline = Duration::from_secs(30);
++        let settle = self.settle_cancelled_peer(future, peer, rids, headers, deadline);
++        if let Some(origin) = uncertain_origin {
++            let (result, origin_abort_acknowledged) = tokio::join!(
++                settle,
++                self.abort_pd_peer(
++                    origin,
++                    rids,
++                    headers,
++                    tokio::time::Instant::now() + deadline,
++                ),
++            );
++            // An abort HTTP ACK is only an accepted command. The interrupted
++            // origin response still cannot prove remote completion.
++            warn!(
++                origin = origin.url(),
++                sibling = peer.url(),
++                ?rids,
++                origin_abort_acknowledged,
++                sibling_settle_succeeded = result.is_ok(),
++                "PD interrupted origin response has no terminal receipt"
++            );
++            result
++        } else {
++            settle.await
++        }
++    }
++
++    async fn decode_failure_response(
++        &self,
++        result: Result<reqwest::Response, reqwest::Error>,
++        context: &PDRequestContext<'_>,
++        prefill: Arc<dyn Worker>,
++        decode: Arc<dyn Worker>,
++    ) -> Response {
++        match result {
++            Ok(response) => {
++                self.handle_decode_error_response(response, context, prefill, decode)
++                    .await
++            }
++            Err(error) => {
++                error!(decode_url = %decode.url(), %error, "Decode request failed");
++                error::bad_gateway(
++                    "decode_server_error",
++                    format!("Decode server error: {error}"),
++                )
++            }
++        }
++    }
++
++    // Until P finishes, continue observing D's body as well as its headers.
++    // Otherwise a streaming D connection can fail while P waits for bootstrap.
++    // Preserve early bytes verbatim for the normal SSE/metadata processing.
++    async fn wait_prefill_with_decode_body<F, T>(
++        response: reqwest::Response,
++        prefill: &mut F,
++    ) -> Result<(T, reqwest::Response, bool), reqwest::Error>
++    where
++        F: Future<Output = T> + Unpin,
++    {
++        let status = response.status();
++        let headers = response.headers().clone();
++        let version = response.version();
++        let mut stream = response.bytes_stream();
++        let mut prefix = Vec::new();
++        let mut ended = false;
++        let result = loop {
++            tokio::select! {
++                result = &mut *prefill => break result,
++                chunk = stream.next(), if !ended => match chunk {
++                    Some(Ok(chunk)) => prefix.push(chunk),
++                    Some(Err(error)) => return Err(error),
++                    None => ended = true,
++                },
++            }
++        };
++        let stream = futures_util::stream::iter(
++            prefix.into_iter().map(Ok::<_, reqwest::Error>),
++        ).chain(stream);
++        let mut response = http::Response::new(reqwest::Body::wrap_stream(stream));
++        *response.status_mut() = status;
++        *response.headers_mut() = headers;
++        *response.version_mut() = version;
++        Ok((result, response.into(), ended))
++    }
++
++    // This span is created only on the failed dispatch path. It records no
++    // request text, token IDs, or headers, and emits no per-request start event.
++    #[tracing::instrument(
++        name = "pd_failure",
++        level = "error",
++        skip_all,
++        fields(
++            rid = ?request.get("rid"),
++            bootstrap_room = ?request.get("bootstrap_room"),
++            prefill_url = %prefill.url(),
++            decode_url = %decode.url(),
++        )
++    )]
++    async fn finish_prefill_failure<F>(
++        &self,
++        (result, aborted, settled): (
++            Result<(StatusCode, Option<bytes::Bytes>), Response>,
++            bool,
++            bool,
++        ),
++        decode_future: F,
++        context: &PDRequestContext<'_>,
++        prefill: Arc<dyn Worker>,
++        decode: Arc<dyn Worker>,
++        rids: &[&str],
++        headers: Option<&HeaderMap>,
++        request: &Value,
++    ) -> Response
++    where
++        F: Future<Output = (Result<reqwest::Response, reqwest::Error>, bool, bool)>,
++    {
++        let original = result.expect_err("failed prefill response");
++        let finish = async {
++            let (response, aborted, settled) = decode_future.await;
++            Self::finish_pd_response(response, aborted, settled).await
++        };
++        let peer = self
++            .settle_failed_peer(
++                finish,
++                decode.as_ref(),
++                (!settled).then_some(prefill.as_ref()),
++                rids,
++                headers,
++            )
++            .await;
++        match peer {
++            Err(cleanup_error) if aborted => cleanup_error,
++            Err(_) => Self::mark_cleanup_unconfirmed(original, "sibling_cleanup_failed"),
++            Ok((response, peer_aborted, peer_settled)) => {
++                if aborted {
++                    if !peer_settled {
++                        return Self::cancellation_unconfirmed(
++                            "The cancelled PD sibling response did not complete; remote cleanup is unconfirmed",
++                        );
++                    }
++                    if !peer_aborted && response.as_ref().is_ok_and(|r| !r.status().is_success()) {
++                        return self
++                            .decode_failure_response(response, context, prefill, decode)
++                            .await;
++                    }
++                }
++                if settled && peer_settled {
++                    original
++                } else {
++                    Self::mark_cleanup_unconfirmed(
++                        original,
++                        if !settled { "origin_response_incomplete" } else { "sibling_response_incomplete" },
++                    )
++                }
++            }
++        }
++    }
++
++    // This span is created only on the failed dispatch path. It records no
++    // request text, token IDs, or headers, and emits no per-request start event.
++    #[tracing::instrument(
++        name = "pd_failure",
++        level = "error",
++        skip_all,
++        fields(
++            rid = ?request.get("rid"),
++            bootstrap_room = ?request.get("bootstrap_room"),
++            prefill_url = %prefill.url(),
++            decode_url = %decode.url(),
++        )
++    )]
++    async fn finish_decode_failure<F>(
++        &self,
++        (result, aborted, _settled): (Result<reqwest::Response, reqwest::Error>, bool, bool),
++        prefill_future: F,
++        context: &PDRequestContext<'_>,
++        prefill: Arc<dyn Worker>,
++        decode: Arc<dyn Worker>,
++        rids: &[&str],
++        headers: Option<&HeaderMap>,
++        request: &Value,
++    ) -> Response
++    where
++        F: Future<
++            Output = (
++                Result<(StatusCode, Option<bytes::Bytes>), Response>,
++                bool,
++                bool,
++            ),
++        >,
++    {
++        let origin_uncertain = result.is_err();
++        if let Err(error) = &result {
++            // Record the observed transport failure before potentially waiting
++            // 30 seconds for cleanup. Display alone omits reqwest's source chain.
++            error!(
++                error_source = ?std::error::Error::source(error),
++                is_connect = error.is_connect(),
++                is_timeout = error.is_timeout(),
++                is_body = error.is_body(),
++                "Decode HTTP failure observed before cleanup"
++            );
++        }
++        let peer = self
++            .settle_failed_peer(
++                prefill_future,
++                prefill.as_ref(),
++                origin_uncertain.then_some(decode.as_ref()),
++                rids,
++                headers,
++            )
++            .await;
++        let cleanup_unconfirmed = match peer {
++            Err(cleanup_error) if aborted => return cleanup_error,
++            Err(_) => true,
++            Ok((peer_result, peer_aborted, peer_settled)) => {
++                if aborted {
++                    if !peer_settled {
++                        return Self::cancellation_unconfirmed(
++                            "The cancelled PD sibling response did not complete; remote cleanup is unconfirmed",
++                        );
++                    }
++                    if !peer_aborted {
++                        if let Err(error) = peer_result {
++                            return error;
++                        }
++                    }
++                }
++                !peer_settled
++            }
++        };
++        if aborted {
++            return Self::native_abort_response(result.expect("known PD abort response")).await;
++        }
++        let response = self
++            .decode_failure_response(result, context, prefill, decode)
++            .await;
++        if cleanup_unconfirmed || origin_uncertain {
++            warn!(origin_uncertain, sibling_cleanup_unconfirmed = cleanup_unconfirmed, "PD failure cleanup outcome");
++            Self::mark_cleanup_unconfirmed(
++                response,
++                if origin_uncertain { "origin_transport_uncertain" } else { "sibling_cleanup_failed" },
++            )
++        } else {
++            response
++        }
++    }
++
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +810,30 @@ impl PDRouter {
+@@ -578,20 +1101,30 @@
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
- 
+
 -        // Build both requests
 +        // Build both requests with their independently selected DP owners.
 +        let routed_start = (context.route == "/generate"
@@ -422,10 +765,10 @@ index 568894f..a2b2e0c 100644
              headers,
              false,
          );
-@@ -604,11 +846,134 @@ impl PDRouter {
+@@ -604,10 +1137,110 @@
          }
          .emit();
- 
+
 -        let (prefill_result, decode_result) =
 -            tokio::join!(prefill_request.send(), decode_request.send());
 +        let merge_prefill_meta = context.route == "/generate";
@@ -446,88 +789,67 @@ index 568894f..a2b2e0c 100644
 +            let aborted = matches!(&result, Err(response) if response.status().as_u16() == 499);
 +            (result, aborted, settled)
 +        };
-+        let decode_future = Self::read_pd_response(decode_request, &rids);
++        let decode_future = async {
++            let (response, aborted, settled) = Self::read_pd_response(decode_request, &rids).await;
++            // Non-streaming already buffers the complete D body below. Poll it
++            // concurrently with P so a truncated body cannot leave P stranded.
++            if !context.is_stream && response.as_ref().is_ok_and(|r| r.status().is_success()) {
++                Self::finish_pd_response(response, aborted, settled).await
++            } else {
++                (response, aborted, settled)
++            }
++        };
 +        tokio::pin!(prefill_future);
 +        tokio::pin!(decode_future);
-+        // Preserve ordinary error precedence and settle-before-retry. Only an
-+        // exact SGLang cancellation proactively aborts its paired request.
-+        // Repeating covers a sibling whose HTTP request registers after abort.
-+        let deadline = Duration::from_secs(30);
-+        let (
-+            (prefill_result, prefill_aborted, prefill_settled),
-+            (decode_result, decode_aborted, decode_settled),
-+        ) = tokio::select! {
-+            prefill_result = &mut prefill_future => {
-+                let decode_result = if prefill_result.1 {
-+                    let finish = async {
-+                        let (response, aborted, settled) = (&mut decode_future).await;
-+                        Self::finish_pd_response(response, aborted, settled).await
-+                    };
-+                    match self
-+                        .settle_cancelled_peer(finish, decode.as_ref(), &rids, headers, deadline)
-+                        .await
-+                    {
-+                        Ok(result) => result,
-+                        Err(error) => return error,
-+                    }
-+                } else {
-+                    (&mut decode_future).await
-+                };
-+                (prefill_result, decode_result)
++        // A failed side must not leave its sibling waiting for bootstrap.
++        // Retain the original response while cleanup runs; an induced 499 or
++        // cleanup failure must not hide the HTTP/transport failure that caused it.
++        let (prefill_result, decode_result) = tokio::select! {
++            p = &mut prefill_future => {
++                if p.0.is_err() {
++                    return self.finish_prefill_failure(
++                        p, &mut decode_future, &context, prefill, decode, &rids, headers, &prefill_json,
++                    ).await;
++                }
++                let d = (&mut decode_future).await;
++                if d.0.as_ref().map_or(true, |response| !response.status().is_success()) {
++                    return self.finish_decode_failure(
++                        d, async { p }, &context, prefill, decode, &rids, headers, &prefill_json,
++                    ).await;
++                }
++                (p.0, d)
 +            },
-+            decode_result = &mut decode_future => {
-+                let prefill_result = if decode_result.1 {
-+                    match self
-+                        .settle_cancelled_peer(
-+                            &mut prefill_future, prefill.as_ref(), &rids, headers, deadline,
-+                        )
-+                        .await
-+                    {
-+                        Ok(result) => result,
-+                        Err(error) => return error,
++            d = &mut decode_future => {
++                if d.0.as_ref().map_or(true, |response| !response.status().is_success()) {
++                    return self.finish_decode_failure(
++                        d, &mut prefill_future, &context, prefill, decode, &rids, headers, &prefill_json,
++                    ).await;
++                }
++                let (p, d) = if context.is_stream {
++                    match Self::wait_prefill_with_decode_body(
++                        d.0.expect("successful decode headers"), &mut prefill_future,
++                    ).await {
++                        Ok((p, response, settled)) => (p, (Ok(response), false, settled)),
++                        Err(error) => return self.finish_decode_failure(
++                            (Err(error), false, false), &mut prefill_future,
++                            &context, prefill, decode, &rids, headers, &prefill_json,
++                        ).await,
 +                    }
 +                } else {
-+                    (&mut prefill_future).await
++                    ((&mut prefill_future).await, d)
 +                };
-+                let decode_result = if prefill_result.1 && !decode_result.2 {
-+                    let (response, aborted, settled) = decode_result;
-+                    match self
-+                        .settle_cancelled_peer(
-+                            Self::finish_pd_response(response, aborted, settled),
-+                            decode.as_ref(), &rids, headers, deadline,
-+                        )
-+                        .await
-+                    {
-+                        Ok(result) => result,
-+                        Err(error) => return error,
-+                    }
-+                } else {
-+                    decode_result
-+                };
-+                (prefill_result, decode_result)
++                if p.0.is_err() {
++                    return self.finish_prefill_failure(
++                        p, async { d }, &context, prefill, decode, &rids, headers, &prefill_json,
++                    ).await;
++                }
++                (p.0, d)
 +            },
 +        };
-+
-+        if (prefill_aborted && !decode_settled) || (decode_aborted && !prefill_settled) {
-+            return Self::cancellation_unconfirmed(
-+                "The cancelled PD sibling connection failed before its response completed; remote cleanup is unconfirmed",
-+            );
-+        }
-+        if prefill_aborted && !decode_aborted {
-+            if let Ok(response) = &decode_result {
-+                if !response.status().is_success() {
-+                    // A genuine sibling failure must not disappear behind 499.
-+                    return self
-+                        .handle_decode_error_response(
-+                            decode_result.unwrap(), &context, prefill, decode,
-+                        )
-+                        .await;
-+                }
-+            }
-+        }
- 
++        let (decode_result, decode_aborted, _) = decode_result;
+
          events::RequestReceivedEvent {}.emit();
- 
++
 +        let prefill_body = match prefill_result {
 +            Ok((_, body)) => body,
 +            Err(error_response) => {
@@ -550,19 +872,16 @@ index 568894f..a2b2e0c 100644
 +        };
 +
 +        if decode_aborted {
-+            return Self::native_abort_response(
-+                decode_result.expect("known PD abort response"),
-+            )
-+            .await;
++            return Self::native_abort_response(decode_result.expect("known PD abort response"))
++                .await;
 +        }
-+
+
          // Process decode response
          match decode_result {
-             Ok(res) => {
-@@ -628,23 +993,13 @@ impl PDRouter {
+@@ -628,23 +1261,13 @@
                          .await;
                  }
- 
+
 -                let merge_prefill_meta = context.route == "/generate";
 -                let capture_prefill_body = context.return_logprob || merge_prefill_meta;
 -                let prefill_body = match self
@@ -584,7 +903,7 @@ index 568894f..a2b2e0c 100644
                      } else {
                          None
                      };
-@@ -657,6 +1012,7 @@ impl PDRouter {
+@@ -657,6 +1280,7 @@
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -592,7 +911,7 @@ index 568894f..a2b2e0c 100644
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +1025,7 @@ impl PDRouter {
+@@ -669,6 +1293,7 @@
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -600,7 +919,7 @@ index 568894f..a2b2e0c 100644
                          prefill_body,
                      )
                      .await
-@@ -830,6 +1187,7 @@ impl PDRouter {
+@@ -830,6 +1455,7 @@
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -608,8 +927,8 @@ index 568894f..a2b2e0c 100644
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,40 +1199,44 @@ impl PDRouter {
- 
+@@ -841,39 +1467,43 @@
+
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
 +            let mut buffer = pd_routing::SseBuffer::default();
@@ -649,7 +968,8 @@ index 568894f..a2b2e0c 100644
                          let _ = tx.send(Err(format!("Stream error: {}", e)));
 -                        break;
 +                        return;
-+                    }
+                     }
+-                }
 +                };
 +                buffer.push(&chunk);
 +                while let Some(event) = buffer.next_event() {
@@ -666,19 +986,18 @@ index 568894f..a2b2e0c 100644
 +                            if tx.send(Ok(event)).is_err() || done { return; }
 +                        }
 +                        Err(error) => { let _ = tx.send(Err(error)); return; }
-                     }
-                 }
-             }
++                    }
++                }
++            }
 +            let tail = buffer.remaining();
 +            if routed_start.is_some() && (!tail.is_empty() || !completed.contains(&usize::MAX) && completed.len() != expected) {
 +                let _ = tx.send(Err("Incomplete PD routing replay stream".to_string()));
 +            } else if !tail.is_empty() {
 +                let _ = tx.send(Ok(tail));
-+            }
+             }
          });
- 
-         let stream = UnboundedReceiverStream::new(rx);
-@@ -914,6 +1276,7 @@ impl PDRouter {
+
+@@ -914,6 +1544,7 @@
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -686,9 +1005,9 @@ index 568894f..a2b2e0c 100644
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1297,9 @@ impl PDRouter {
+@@ -934,6 +1565,9 @@
          }
- 
+
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
 +            if routed_start.is_some() {
 +                return error::bad_gateway("invalid_routing_replay", "Invalid decode JSON for PD routing replay");
@@ -696,15 +1015,16 @@ index 568894f..a2b2e0c 100644
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1317,18 @@ impl PDRouter {
+@@ -951,14 +1585,18 @@
                          None
                      }
                  });
 -        let prefill_meta = prefill_json.as_ref().and_then(|json| json.get("meta_info"));
-+        let prefill_meta = prefill_json.as_ref().and_then(pd_routing::prefill_metadata);
- 
+-
 -        let changed = Self::merge_prefill_meta_in_json(
 -            prefill_meta,
++        let prefill_meta = prefill_json.as_ref().and_then(pd_routing::prefill_metadata);
++
 +        let mut changed = Self::merge_prefill_meta_in_json(
 +            prefill_meta.as_ref(),
              &mut decode_json,
@@ -718,7 +1038,7 @@ index 568894f..a2b2e0c 100644
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1361,24 @@ impl PDRouter {
+@@ -991,24 +1629,24 @@
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
@@ -738,7 +1058,7 @@ index 568894f..a2b2e0c 100644
 +                    error = ?e,
 +                    "Prefill HTTP request failed"
                  );
- 
+
 -                // Return error immediately - don't wait for decode to timeout
                  return Err(error::bad_gateway(
                      "prefill_server_error",
@@ -750,8 +1070,8 @@ index 568894f..a2b2e0c 100644
                  ));
              }
          };
-@@ -1018,11 +1388,33 @@ impl PDRouter {
- 
+@@ -1018,11 +1656,33 @@
+
          // Check if prefill succeeded
          if !prefill_status.is_success() {
 +            error!(
@@ -785,11 +1105,11 @@ index 568894f..a2b2e0c 100644
 +                )
 +                    .into_response());
 +            }
- 
+
              error!(
                  "Prefill server returned error status prefill_url={} status={} body={}",
-@@ -1061,7 +1453,10 @@ impl PDRouter {
- 
+@@ -1061,18 +1721,31 @@
+
          let prefill_body = if capture_body {
              match prefill_response.bytes().await {
 -                Ok(body) => Some(body),
@@ -798,21 +1118,34 @@ index 568894f..a2b2e0c 100644
 +                    Some(body)
 +                }
                  Err(e) => {
-                     warn!("Failed to read prefill response body for merging: {}", e);
-                     None
-@@ -1071,7 +1466,10 @@ impl PDRouter {
+-                    warn!("Failed to read prefill response body for merging: {}", e);
+-                    None
++                    return Err(error::bad_gateway(
++                        "prefill_read_failed",
++                        format!("Failed to read prefill response: {e}"),
++                    ));
+                 }
+             }
+         } else {
              // For non-logprob requests, just consume the response without storing
              debug!("Consuming prefill response body (non-logprob request)");
              match prefill_response.bytes().await {
 -                Ok(_) => debug!("Prefill response consumed successfully"),
+-                Err(e) => warn!("Error consuming prefill response: {}", e),
 +                Ok(_) => {
 +                    *settled = true;
 +                    debug!("Prefill response consumed successfully");
 +                }
-                 Err(e) => warn!("Error consuming prefill response: {}", e),
++                Err(e) => {
++                    return Err(error::bad_gateway(
++                        "prefill_read_failed",
++                        format!("Failed to read prefill response: {e}"),
++                    ))
++                }
              }
              None
-@@ -1111,6 +1509,18 @@ impl PDRouter {
+         };
+@@ -1111,6 +1784,18 @@
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -831,10 +1164,10 @@ index 568894f..a2b2e0c 100644
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1550,6 @@ impl PDRouter {
+@@ -1140,27 +1825,6 @@
              }
          }
- 
+
 -        if let Some(prefill_routed) = prefill_meta.and_then(|meta| meta.get("routed_experts")) {
 -            if let Some(decode_routed) = decode_meta.get_mut("routed_experts") {
 -                if Self::merge_base64_int32_meta_field(
@@ -859,10 +1192,10 @@ index 568894f..a2b2e0c 100644
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1564,6 @@ impl PDRouter {
+@@ -1175,44 +1839,6 @@
          changed
      }
- 
+
 -    fn merge_base64_int32_meta_field(
 -        prefill_value: &Value,
 -        decode_value: &mut Value,
@@ -904,7 +1237,7 @@ index 568894f..a2b2e0c 100644
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1574,19 @@ impl PDRouter {
+@@ -1223,31 +1849,19 @@
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
@@ -945,11 +1278,11 @@ index 568894f..a2b2e0c 100644
 +        Ok(bytes::Bytes::from(merged))
      }
  }
- 
-@@ -1271,11 +1610,11 @@ impl RouterTrait for PDRouter {
+
+@@ -1271,11 +1885,11 @@
              }
          };
- 
+
 -        let prefill_url = format!("{}/health_generate", prefill.url());
 +        let prefill_url = format!("{}/health_generate", prefill.base_url());
          let (prefill_result, decode_result) = tokio::join!(
@@ -959,11 +1292,11 @@ index 568894f..a2b2e0c 100644
 +                .get(format!("{}/health_generate", decode.base_url()))
                  .send()
          );
- 
-@@ -1523,6 +1862,36 @@ mod tests {
+
+@@ -1523,6 +2137,36 @@
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
- 
+
 +    #[test]
 +    fn test_pd_dp_requests_select_independent_owners() {
 +        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
@@ -997,7 +1330,7 @@ index 568894f..a2b2e0c 100644
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
          let policy_registry =
-@@ -1635,7 +2004,6 @@ mod tests {
+@@ -1635,7 +2279,6 @@
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -1005,7 +1338,7 @@ index 568894f..a2b2e0c 100644
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +2017,8 @@ mod tests {
+@@ -1649,6 +2292,8 @@
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -1014,7 +1347,7 @@ index 568894f..a2b2e0c 100644
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +2029,9 @@ mod tests {
+@@ -1659,7 +2304,9 @@
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -1024,16 +1357,16 @@ index 568894f..a2b2e0c 100644
 +                "routed_experts": b64_i32(&[99, 99, 99, 99, 5, 6, 7, 8]),
              }
          });
- 
-@@ -1670,6 +2042,7 @@ mod tests {
+
+@@ -1670,6 +2317,7 @@
              true,
          ));
- 
+
 +        pd_routing::merge_routed_experts(Some(&prefill_meta), &mut decode_json, Some(0)).unwrap();
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +2081,24 @@ mod tests {
+@@ -1708,21 +2356,24 @@
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -1049,7 +1382,7 @@ index 568894f..a2b2e0c 100644
 +                "completion_tokens": 1,
              }
          });
- 
+
 -        assert!(PDRouter::merge_prefill_meta_in_json(
 +        assert!(pd_routing::merge_routed_experts(
              Some(&prefill_meta),
@@ -1059,10 +1392,10 @@ index 568894f..a2b2e0c 100644
 -        ));
 +            Some(0),
 +        ).unwrap());
- 
+
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +2161,7 @@ mod tests {
+@@ -1785,7 +2436,7 @@
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -1070,8 +1403,8 @@ index 568894f..a2b2e0c 100644
 +            vec![21, 22]
          );
      }
- 
-@@ -1817,6 +2193,7 @@ mod tests {
+
+@@ -1817,6 +2468,7 @@
              false,
              false,
              None,
@@ -1079,7 +1412,7 @@ index 568894f..a2b2e0c 100644
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +2247,7 @@ mod tests {
+@@ -1870,6 +2522,7 @@
                  false,
                  None,
                  None,
@@ -1255,22 +1588,23 @@ index 0000000..283023d
 +    Ok((Bytes::from(output), Some(index), false))
 +}
 diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
+index 72f0047..3b18123 100644
 --- a/src/routers/http/router.rs
 +++ b/src/routers/http/router.rs
-@@ -12,6 +12,12 @@
- use serde_json::Value;
+@@ -13,6 +13,12 @@ use serde_json::Value;
  use tokio_stream::wrappers::UnboundedReceiverStream;
  use tracing::{debug, error};
-+
+ 
 +#[derive(Clone)]
 +struct NativeRequestAbort;
 +
 +#[derive(Clone)]
 +struct WorkerDispatched;
- 
++
  use crate::{
      app_context::AppContext,
-@@ -253,7 +259,13 @@
+     config::types::RetryConfig,
+@@ -253,7 +259,13 @@ impl Router {
                  res
              },
              // should_retry predicate
@@ -1285,7 +1619,7 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
              // on_backoff hook
              |delay, attempt| {
                  // Layer 3 worker metrics
-@@ -342,7 +354,10 @@
+@@ -342,7 +354,10 @@ impl Router {
          events::RequestReceivedEvent {}.emit();
  
          let status = response.status();
@@ -1297,10 +1631,10 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
  
          // Record worker errors for server errors (5xx)
          if status.is_server_error() {
-@@ -592,22 +607,34 @@
+@@ -592,22 +607,34 @@ impl Router {
                      worker_url, route, e
                  );
-
+ 
 -                return convert_reqwest_error(e);
 +                let connect_failed = e.is_connect();
 +                let mut response = convert_reqwest_error(e);
@@ -1310,7 +1644,7 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
 +                return response;
              }
          };
-
+ 
          let status = StatusCode::from_u16(res.status().as_u16())
              .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
  
@@ -1335,7 +1669,7 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
                      response
                  }
                  Err(e) => {
-@@ -658,7 +685,9 @@
+@@ -658,7 +685,9 @@ impl Router {
                  response = AttachedBody::wrap_response(response, guard);
              }
              response
@@ -1344,5 +1678,5 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
 +        response.extensions_mut().insert(WorkerDispatched);
 +        response
      }
-
+ 
      async fn build_rerank_response(

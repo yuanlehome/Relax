@@ -74,7 +74,7 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
-from .loss import loss_function, normalize_reduced_loss_metrics
+from .loss import get_log_probs_and_entropy, loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
     validate_mtp_only_trainable_params,
@@ -965,6 +965,24 @@ def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[li
     return origin_values
 
 
+def _use_score_centering_response_head(args: Namespace) -> bool:
+    if not Envs.RELAX_SCORE_CENTERING_RESPONSE_ONLY_LM_HEAD or args.advantage_estimator != "score_centering":
+        return False
+    for option in (
+        "overlap_grad_reduce",
+        "defer_embedding_wgrad_compute",
+        "overlap_moe_expert_parallel_comm",
+        "enable_mtp_training",
+        "fp8",
+        "fp4",
+    ):
+        if getattr(args, option, None):
+            raise ValueError(f"Score Centering response-only LM head requires {option} off")
+    if not args.recompute_loss_function or not getattr(args, "recompute_loss_function_use_reentrant", True):
+        raise ValueError("Score Centering response-only LM head requires reentrant loss recomputation")
+    return True
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -1106,13 +1124,21 @@ def forward_only(
         }
         if batch.get("padding_mask") is not None:
             forward_kwargs["padding_mask"] = batch["padding_mask"]
-        output_tensor = model(**forward_kwargs)
+        response_head = f is get_log_probs_and_entropy and _use_score_centering_response_head(args)
+        score = f
+        if response_head:
+            forward_kwargs["fp32_output"] = False
+            with _bypass_output_layer(model) as lm_head_forward:
+                output_tensor = model(**forward_kwargs)
+            score = partial(f, lm_head_forward=lm_head_forward)
+        else:
+            output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
             inner.pg_collection.cp = _orig_cp_group
 
         f_partial = partial(
-            f,
+            score,
             args=args,
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
@@ -1542,7 +1568,15 @@ def train_one_step(
             # SFT chunking defers the main lm_head into the loss. MTP-only
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
-            if should_bypass_main_output_layer(args):
+            if _use_score_centering_response_head(args):
+                forward_kwargs["fp32_output"] = False
+                with _bypass_output_layer(model, recompute_chunks=True) as lm_head_forward:
+                    if use_indexer_replay:
+                        with IndexerReplay.forward_stage():
+                            output_tensor = model(**forward_kwargs)
+                    else:
+                        output_tensor = model(**forward_kwargs)
+            elif should_bypass_main_output_layer(args):
                 # The chunked-MTP patch runs the MTP heads via the class-level
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.

@@ -45,7 +45,9 @@ NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 N_SAMPLES="${N_SAMPLES:-8}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE + (ROLLOUT_BATCH_SIZE + 3) / 4))}"
-AGENTIC_CONCURRENCY="${AGENTIC_CONCURRENCY:-${OVER_SAMPLING_BATCH_SIZE}}"
+AGENTIC_RUNTIME_GROUPS="${AGENTIC_RUNTIME_GROUPS:-80}"
+AGENTIC_PREPARE_GROUPS="${AGENTIC_PREPARE_GROUPS:-16}"
+AGENTIC_CONCURRENCY="${AGENTIC_CONCURRENCY:-$((AGENTIC_RUNTIME_GROUPS + AGENTIC_PREPARE_GROUPS))}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-32768}"
 MAX_CONTEXT_TOKENS="$(python3 - "${EXAMPLE_DIR}/config.yaml" <<'PY'
 import sys
@@ -58,14 +60,18 @@ PY
 )"
 (( NUM_ROLLOUT > 0 && N_SAMPLES >= 2 && ROLLOUT_BATCH_SIZE > 0 ))
 (( OVER_SAMPLING_BATCH_SIZE >= ROLLOUT_BATCH_SIZE && AGENTIC_CONCURRENCY > 0 ))
+(( AGENTIC_RUNTIME_GROUPS > 0 && AGENTIC_PREPARE_GROUPS > 0 ))
+(( AGENTIC_CONCURRENCY >= AGENTIC_RUNTIME_GROUPS + AGENTIC_PREPARE_GROUPS ))
 (( MAX_CONTEXT_TOKENS > MAX_OUTPUT_TOKENS && MAX_OUTPUT_TOKENS > 0 ))
 now="$(date +%Y%m%d-%H%M%S)"
 SUBMISSION_ID="${RELAX_SUBMISSION_ID:-${EXP_NAME}-${now}-${BASHPID}}"
 printf -v AGENT_COMMAND '%q -m examples.claude_code_harbor.agent' "${HARBOR_PYTHON}"
 
-# Use the mainline model implementation. The streamed PLE path requires every
-# PLE parameter to be frozen; this recipe freezes only its ngram table.
-export RELAX_QWEN38_PLE_STREAMED=0
+# Checkpoint PLE by HC stream while keeping its projection, norm, and convolution
+# weights trainable. The ngram table remains frozen for CPU offload.
+export RELAX_QWEN38_PLE_STREAMED=1
+# Project only response rows and checkpoint bounded SC vocabulary blocks.
+export RELAX_SCORE_CENTERING_RESPONSE_ONLY_LM_HEAD=1
 export QWEN38_PLE_CPU_OFFLOAD=1
 export MCORE_QSA_SPARSE_BACKEND=flex
 export RELAX_QWEN38_QSA_FUSED_ATTENTION=triton_v2
@@ -89,12 +95,15 @@ runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env = runtime.setdefault("env_vars", {})
 env.pop("MC_FORCE_TCP", None)
 env.update(
+    # Disable Ray task-state telemetry only for this experiment's new processes.
+    RAY_task_events_report_interval_ms="0",
     MOONCAKE_PROTOCOL="rdma",
     PYTORCH_ALLOC_CONF="expandable_segments:False",
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False",
 )
 for name in (
     "RELAX", "PYTHONPATH", "PATH", "MCORE_QSA_SPARSE_BACKEND",
+    "RELAX_SCORE_CENTERING_RESPONSE_ONLY_LM_HEAD",
     "QWEN38_PLE_CPU_OFFLOAD", "NVTE_FLASH_ATTN_V2", "NVTE_FLASH_ATTN_V3",
     "NVTE_FLASH_ATTN_V4", "EP_DISABLE_GIN", "NVSHMEM_DISABLE_NCCL",
     "NCCL_P2P_PXN_LEVEL", "NCCL_NVLS_ENABLE",
@@ -158,6 +167,8 @@ AGENTIC_ARGS=(
     --agent-cwd "${RELAX_ROOT}"
     --agent-timeout 7200
     --agentic-concurrency "${AGENTIC_CONCURRENCY}"
+    --agentic-runtime-groups "${AGENTIC_RUNTIME_GROUPS}"
+    --agentic-prepare-groups "${AGENTIC_PREPARE_GROUPS}"
     --agentic-admission-expected-decode-cap 4096
     --agentic-admission-max-wait-s 5
     --agentic-admission-pressure-threshold 0.92
@@ -234,7 +245,7 @@ PERF_ARGS=(
     --use-dynamic-batch-size
     --max-tokens-per-gpu "$((MAX_CONTEXT_TOKENS / 2))"
     --log-probs-max-tokens-per-gpu "$((MAX_CONTEXT_TOKENS / 2))"
-    --log-probs-chunk-size 32
+    --log-probs-chunk-size 512
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1

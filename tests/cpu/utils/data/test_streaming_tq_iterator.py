@@ -637,6 +637,7 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
 
 def _known_tensor_broadcast_worker(rank, rendezvous):
     import torch.distributed as dist
+    from tensordict import TensorDict
 
     torch.set_num_threads(1)
     timeout = timedelta(seconds=90)
@@ -656,6 +657,7 @@ def _known_tensor_broadcast_worker(rank, rendezvous):
 
         with pytest.MonkeyPatch.context() as monkeypatch:
             stream_module = _load_stream_module(monkeypatch)
+            monkeypatch.setattr(stream_module, "TensorDict", TensorDict)
             for index, axis in enumerate(axes):
                 monkeypatch.setattr(
                     stream_module.mpu,
@@ -689,6 +691,75 @@ def _known_tensor_broadcast_worker(rank, rendezvous):
                 assert calls.count(groups["context"]) == int(tp == 0)
                 assert calls.count(groups["tensor_model"]) == 1
                 assert calls.count(groups["pipeline_model"]) == int(broadcast_pp)
+                # Force multiple chunks, a partial tail and an empty middle row.
+                monkeypatch.setattr(stream_module, "_TOPK_BROADCAST_BYTES", 8)
+                for dtype in (torch.int32, torch.int64, torch.float32):
+                    values = torch.arange(7, dtype=dtype) + (0 if broadcast_pp else 100 * pp)
+                    if dtype.is_floating_point:
+                        values[3] = -torch.inf
+                    shapes = [torch.Size([2]), torch.Size([0]), torch.Size([5])]
+                    rows = stream_module._broadcast_topk_rows(
+                        values if is_src else None, dtype, shapes, torch.device("cpu"), broadcast_pp
+                    )
+                    assert [row.shape for row in rows] == shapes
+                    assert torch.equal(torch.cat(rows), values)
+                    assert all(row.dtype == dtype for row in rows)
+                # Exercise the complete metadata-strip, object-collective and
+                # tensor-reattach protocol using real TensorDict jagged storage.
+                monkeypatch.setattr(
+                    stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu")
+                )
+
+                def inspect_metadata(payload, source_rank):
+                    if payload[0] is not None:
+                        assert not any(key in payload[0] for key in stream_module._SCORE_TOPK_FIELDS)
+
+                monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", inspect_metadata)
+                values = torch.arange(14, dtype=torch.int32).reshape(7, 2) + (0 if broadcast_pp else 100 * pp)
+                sample_rows = [values[:2], values[2:2], values[2:]]
+                scores = [-row.float() for row in sample_rows]
+                source = TensorDict(
+                    {
+                        "rollout_topk_token_ids": torch.nested.nested_tensor(sample_rows, layout=torch.jagged),
+                        "rollout_topk_log_probs": torch.nested.nested_tensor(scores, layout=torch.jagged),
+                        "response_lengths": torch.tensor([2, 0, 5]),
+                    },
+                    batch_size=[3],
+                )
+                result, _ = stream_module.get_data_from_transfer_queue(
+                    args=Namespace(),
+                    tq_client=None,
+                    data_fields=list(source.keys()),
+                    batch_size=3,
+                    partition_id="test",
+                    task_name="train",
+                    sampling_config={},
+                    batch_index=0,
+                    broadcast_pp=broadcast_pp,
+                    post_process=False,
+                    prefetched_rollout_data=[source if is_src else None, None],
+                )
+                assert result["response_lengths"] == [2, 0, 5]
+                assert "rollout_topk_token_ids" in source, "Source TensorDict must not be mutated"
+                for key, expected in (("rollout_topk_token_ids", sample_rows), ("rollout_topk_log_probs", scores)):
+                    for actual, reference in zip(result[key], expected, strict=True):
+                        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                # Every rank receives a source extraction error before any
+                # tensor collective, preventing a malformed producer deadlock.
+                with pytest.raises(RuntimeError, match="Unable to transfer Score Centering Top-K rows"):
+                    stream_module.get_data_from_transfer_queue(
+                        args=Namespace(),
+                        tq_client=None,
+                        data_fields=["rollout_topk_token_ids"],
+                        batch_size=1,
+                        partition_id="test",
+                        task_name="train",
+                        sampling_config={},
+                        batch_index=1,
+                        broadcast_pp=broadcast_pp,
+                        post_process=False,
+                        prefetched_rollout_data=[{"rollout_topk_token_ids": [object()]} if is_src else None, None],
+                    )
     finally:
         dist.destroy_process_group(dist.group.WORLD)
 
@@ -697,3 +768,42 @@ def test_known_tensor_broadcast_cpu_processes(tmp_path):
     torch.multiprocessing.spawn(
         _known_tensor_broadcast_worker, args=(str(tmp_path / "rendezvous"),), nprocs=8, join=True
     )
+
+
+@pytest.mark.parametrize("dynamic_cp", [False, True])
+def test_sc_topk_stays_host_resident_while_training_fields_move(monkeypatch, dynamic_cp):
+    """Meta is a real non-CPU destination; no accelerator or transfer mock is
+    used."""
+    stream = _load_stream_module(monkeypatch)
+    from relax.backends.megatron import cp_utils
+
+    monkeypatch.setattr(cp_utils, "mpu", stream.mpu)
+    monkeypatch.setattr(stream.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(stream.mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(stream.device_utils, "make_current_torch_device", lambda: torch.device("meta"))
+    ids = torch.arange(16).reshape(8, 2) + 2**24
+    scores = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    data = {
+        "tokens": [list(range(12))],
+        "total_lengths": [12],
+        "response_lengths": [8],
+        "loss_masks": [[1] * 8],
+        "rollout_log_probs": [list(range(8))],
+        "rollout_topk_token_ids": [ids.flatten().tolist()],
+        "rollout_topk_log_probs": [scores.flatten().tolist()],
+    }
+    args = Namespace(
+        loss_type="policy_loss",
+        qkv_format="thd",
+        use_opd=False,
+        dynamic_context_parallel=dynamic_cp,
+        allgather_cp=False,
+        rollout_top_logprobs_num=2,
+    )
+    stream.post_process_rollout_data(args, data)
+    assert data["tokens"][0].device.type == "meta"
+    assert data["rollout_log_probs"][0].device.type == "meta"
+    rows = list(range(8)) if dynamic_cp else [6, 7]
+    for key, expected in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", scores)):
+        assert data[key][0].device.type == "cpu"
+        torch.testing.assert_close(data[key][0], expected[rows], rtol=0, atol=0)

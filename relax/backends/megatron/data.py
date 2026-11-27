@@ -960,7 +960,10 @@ def get_batch(
                     total - response
                     for total, response in zip(batch["total_lengths"], batch["response_lengths"], strict=True)
                 ]
+    # SC candidate tables stay on the host until the loss stage consumes them.
+    host_topk = {key: batch.pop(key) for key in ("rollout_topk_token_ids", "rollout_topk_log_probs") if key in batch}
     batch = move_tensors_to_device(batch, batch["tokens"].device)
+    batch.update(host_topk)
     if pack_device is not None:
         batch = PrepackedBatch(batch)
     if getattr(get_args(), "_relax_qwen35_optimized", False):

@@ -3,12 +3,13 @@
 """Megatron scoring and batch alignment for Score Centering."""
 
 from argparse import Namespace
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
+from torch.utils.checkpoint import checkpoint
 
 from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp
 
@@ -191,6 +192,61 @@ class _ScoreCenteringLogProbs(torch.autograd.Function):
         return grad_logits, None, None, None, None, None, None, None, None, None
 
 
+def _project_score_centering_blocks(
+    hidden_states: torch.Tensor,
+    responses: list[tuple[torch.Tensor, torch.Tensor]],
+    ids: torch.Tensor,
+    lengths: list[int],
+    process_group: Any,
+    *,
+    args: Namespace,
+    chunk_size: int,
+    vocab_size: int,
+    with_entropy: bool,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def project(hidden: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        logits, _ = lm_head_forward(hidden.unsqueeze(1))
+        values, entropy, _ = _ScoreCenteringLogProbs.apply(
+            logits[:, 0],
+            targets,
+            [(0, hidden.size(0))],
+            process_group,
+            chunk_size,
+            vocab_size,
+            args.rollout_temperature,
+            with_entropy,
+            with_entropy and getattr(args, "entropy_coef", 0.0) != 0,
+            0,
+        )
+        return values, entropy
+
+    values = []
+    entropies = []
+    for (hidden, _), sample_ids in zip(responses, ids.split(lengths), strict=True):
+        if hidden.size(0) == 0:
+            continue
+        for block, targets in zip(hidden.split(chunk_size), sample_ids.split(chunk_size), strict=True):
+            if torch.is_grad_enabled():
+                # A frozen trunk still needs to produce gradients for a trainable head.
+                if not block.requires_grad:
+                    block = block.detach().requires_grad_()
+                scores, entropy = checkpoint(project, block, targets, use_reentrant=True)
+            else:
+                scores, entropy = project(block, targets)
+            values.append(scores)
+            if entropy is not None:
+                if getattr(args, "entropy_coef", 0.0) == 0:
+                    entropy = entropy.detach()
+                entropies.append(entropy)
+
+    if not values:
+        # An empty CP shard still participates in decoder backward collectives.
+        empty = hidden_states.reshape(-1, hidden_states.size(-1))[:0].sum(dim=-1, dtype=torch.float32)
+        return empty[:, None].expand(0, ids.size(1)), empty.detach() if with_entropy else None
+    return torch.cat(values), torch.cat(entropies) if with_entropy else None
+
+
 def get_score_centering_batch(
     logits: torch.Tensor,
     responses: list[tuple[torch.Tensor, torch.Tensor]],
@@ -201,9 +257,10 @@ def get_score_centering_batch(
     with_entropy: bool,
     with_topk: bool,
     topk_k: int,
+    lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Score response views from one microbatch without copying their
-    logits."""
+    """Score response views from one microbatch, optionally projecting each
+    block."""
     if not responses:
         fields = {"log_probs": []}
         if with_entropy:
@@ -217,14 +274,7 @@ def get_score_centering_batch(
     vocab_size = getattr(args, "score_centering_vocab_size", None)
     if vocab_size is None or vocab_size <= 0:
         raise ValueError("Score centering requires the model's unpadded vocabulary size.")
-    flat = logits.view(-1, logits.size(-1))
-    spans = []
-    origin, row_stride = flat.storage_offset(), flat.stride(0)
-    for response, _ in responses:
-        start = (response.storage_offset() - origin) // row_stride
-        spans.append((start, start + response.size(0)))
-
-    lengths = [stop - start for start, stop in spans]
+    lengths = [response.size(0) for response, _ in responses]
     tokens = [targets for _, targets in responses]
     if candidate_ids is None:
         ids = torch.cat(tokens)[:, None]
@@ -234,19 +284,42 @@ def get_score_centering_batch(
             row_ids[:, 0] = targets
             row_ids[:, 1:] = candidates
     chunk_size = args.log_probs_chunk_size if args.log_probs_chunk_size > 0 else 1024
-    k = min(max(int(topk_k), 1), flat.size(-1)) if with_topk else 0
-    values, entropy, topk = _ScoreCenteringLogProbs.apply(
-        flat,
-        ids,
-        spans,
-        process_group,
-        chunk_size,
-        vocab_size,
-        args.rollout_temperature,
-        with_entropy,
-        with_entropy and getattr(args, "entropy_coef", 0.0) != 0,
-        k,
-    )
+    if lm_head_forward is None:
+        flat = logits.view(-1, logits.size(-1))
+        origin, row_stride = flat.storage_offset(), flat.stride(0)
+        spans = []
+        for (response, _), length in zip(responses, lengths, strict=True):
+            start = (response.storage_offset() - origin) // row_stride
+            spans.append((start, start + length))
+        k = min(max(int(topk_k), 1), flat.size(-1)) if with_topk else 0
+        values, entropy, topk = _ScoreCenteringLogProbs.apply(
+            flat,
+            ids,
+            spans,
+            process_group,
+            chunk_size,
+            vocab_size,
+            args.rollout_temperature,
+            with_entropy,
+            with_entropy and getattr(args, "entropy_coef", 0.0) != 0,
+            k,
+        )
+    else:
+        if with_topk:
+            raise ValueError("Score Centering response-only LM head does not collect per-rank Top-K indices")
+        values, entropy = _project_score_centering_blocks(
+            logits,
+            responses,
+            ids,
+            lengths,
+            process_group,
+            args=args,
+            chunk_size=chunk_size,
+            vocab_size=vocab_size,
+            with_entropy=with_entropy,
+            lm_head_forward=lm_head_forward,
+        )
+        topk = None
 
     result = {"log_probs": list(values[:, 0].split(lengths))}
     if entropy is not None:

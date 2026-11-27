@@ -3090,6 +3090,17 @@ class AgenticSessionShard:
                                     finish_reason=result.finish_type,
                                 )
                         except BaseException as error:
+                            if isinstance(error, httpx.HTTPStatusError):
+                                logger.warning(
+                                    "Agentic HTTP request failed group_id=%s session_id=%s logical_request_id=%s "
+                                    "backend_request_id=%s http_status=%s error_type=%s",
+                                    group.group_id,
+                                    session.session_id,
+                                    ir.request_id,
+                                    backend_request_id,
+                                    error.response.status_code,
+                                    type(error).__name__,
+                                )
                             router_unavailable = (
                                 not managed_kwargs
                                 and router_recovery_enabled

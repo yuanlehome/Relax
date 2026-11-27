@@ -53,7 +53,7 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
-from relax.utils.tq.lifecycle import clear_training_partition
+from relax.utils.tq.lifecycle import clear_training_partition, training_partition_steps
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -79,6 +79,7 @@ class _StepContext:
     output_groups: List[List[Sample]] = field(default_factory=list)
     # Each task owns its groups once it starts; until then the step owns them.
     tq_put_tasks: dict[asyncio.Task[None], list[GroupExport]] = field(default_factory=dict)
+    tq_group_counts: dict[asyncio.Task[None], int] = field(default_factory=dict)
     progress: Any = None
     scored: int = 0
     prepared: int = 0
@@ -286,6 +287,8 @@ class AgenticResidentPipeline:
         self._group_observations: dict[asyncio.Task[Optional[GroupExport]], _GroupObservation] = {}
         self._finalized_groups: Deque[GroupExport] = deque()
         self._active_step: Optional[_StepContext] = None
+        self._boundary_pause_reason: str | None = None
+        self._refill_block_reason = "none"
         self._stage_recorder = StageRecorder(args)
 
     def snapshot(self) -> dict[str, object]:
@@ -306,6 +309,8 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self._runtime_target is not None:
+            snapshot.update(self._scheduler_snapshot())
         if self.runtime_domain.teacher_routing_enabled:
             snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
         return snapshot
@@ -344,6 +349,8 @@ class AgenticResidentPipeline:
 
             samples = [sample for group in output.samples for sample in group]
             metrics = dict(output.metrics or {})
+            if self._runtime_target is not None:
+                metrics.update(self._scheduler_metrics())
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
             if self.runtime_domain.teacher_routing_enabled:
@@ -451,6 +458,7 @@ class AgenticResidentPipeline:
         """Express rollout control as collect -> close -> lease -> fill ->
         wait."""
 
+        self._boundary_pause_reason = None
         if not context.final_backfill:
             self.transfer_domain.open_partition(
                 context.rollout_id,
@@ -491,9 +499,16 @@ class AgenticResidentPipeline:
             await self._lease_prepared_groups(context)
             self.prepare_domain.fill(self._runtime_group_gap(context))
             self._refresh_progress(context)
+            wait_timeout = (
+                1.0
+                if self._runtime_target is not None and self._refill_block_reason == "weight_update"
+                else _IDLE_HEARTBEAT_INTERVAL_S
+            )
             try:
-                await asyncio.wait_for(self._changed.wait(), timeout=_IDLE_HEARTBEAT_INTERVAL_S)
+                await asyncio.wait_for(self._changed.wait(), timeout=wait_timeout)
             except asyncio.TimeoutError:
+                if wait_timeout != _IDLE_HEARTBEAT_INTERVAL_S:
+                    continue
                 logger.info(
                     format_agentic_event(
                         "ROLLOUT",
@@ -511,6 +526,7 @@ class AgenticResidentPipeline:
             if task.done():
                 task.result()
                 del context.tq_put_tasks[task]
+                context.tq_group_counts.pop(task, None)
         self.prepare_domain.collect()
 
         self._collect_finalized_groups()
@@ -572,6 +588,7 @@ class AgenticResidentPipeline:
 
         task = asyncio.create_task(transfer(), name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups")
         context.tq_put_tasks[task] = pending_groups
+        context.tq_group_counts[task] = len(groups)
         task.add_done_callback(lambda _: self._changed.set())
 
     async def _transfer_and_record(
@@ -650,6 +667,7 @@ class AgenticResidentPipeline:
         if context.tq_put_tasks:
             await asyncio.gather(*context.tq_put_tasks)
             context.tq_put_tasks.clear()
+            context.tq_group_counts.clear()
 
     def _collect_finalized_groups(self) -> None:
         """Move completed Group task results into the finalized FIFO."""
@@ -702,18 +720,29 @@ class AgenticResidentPipeline:
         await self._await_tq_puts(context)
         self.transfer_domain.release_finished_partitions()
 
-        await finish_before_cancellation(
-            self.runtime_domain.pause_generation(),
-            "agentic-generation-pause",
-        )
+        keep_generation_open = await self._continue_generation_after_batch(context)
+        if not keep_generation_open:
+            await finish_before_cancellation(
+                self.runtime_domain.pause_generation(),
+                "agentic-generation-pause",
+            )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
+        final_steady_drain = (
+            self._runtime_target is not None
+            and self._final_generation_step(context)
+            and self.transfer_domain.total_debt == 0
+        )
+        if final_steady_drain:
+            retain_resident_tail = False
         retain_prepared = (
             self.args.agentic_prelaunch
             and not context.final_backfill
             and context.rollout_id + 1 < self.args.num_rollout
         )
         if not retain_resident_tail:
-            if not retain_prepared:
+            if final_steady_drain:
+                await self.prepare_domain.shutdown()
+            elif not retain_prepared:
                 await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
@@ -734,6 +763,12 @@ class AgenticResidentPipeline:
             # Runtime tail is still owned until the normal pipeline shutdown.
             await self.prepare_domain.discard_step()
 
+        if keep_generation_open:
+            # Completed surplus belongs to the following partition. Refill only
+            # within the bounded downstream budget; never submit it twice.
+            self._collect_finalized_groups()
+            await self._lease_prepared_groups(context)
+            self.prepare_domain.fill(self._runtime_group_gap(context))
         await self.runtime_domain.trim_memory()
         return RolloutFnTrainOutput(
             samples=context.output_groups,
@@ -804,6 +839,9 @@ class AgenticResidentPipeline:
         self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
+        if self._runtime_target is not None:
+            gap, self._refill_block_reason = self._steady_refill_decision(context)
+            return gap
         oversample_groups = 0
         if not context.final_backfill:
             oversample_groups = self.args.over_sampling_batch_size - self.args.rollout_batch_size
@@ -813,6 +851,124 @@ class AgenticResidentPipeline:
             - len(self._active_group_tasks)
             - len(self._finalized_groups)
         )
+
+    @property
+    def _runtime_target(self) -> int | None:
+        return getattr(self.args, "agentic_runtime_groups", None)
+
+    def _final_generation_step(self, context: _StepContext) -> bool:
+        return context.final_backfill or context.rollout_id + 1 >= self.args.num_rollout
+
+    def _steady_refill_decision(self, context: _StepContext) -> tuple[int, str]:
+        target = self._runtime_target
+        assert target is not None
+        if self._boundary_pause_reason is not None:
+            return 0, self._boundary_pause_reason
+        if get_local_rollout_manager().training_weight_updating:
+            return 0, "weight_update"
+        if self._final_generation_step(context):
+            # Final work repays physical debt only, including Reward tasks whose
+            # original Runtime groups already finished.
+            gap = self.transfer_domain.total_debt - len(self._active_group_tasks) - len(self._finalized_groups)
+            runtime_gap = max(0, target - self.runtime_domain.runtime_group_count)
+            return min(max(0, gap), runtime_gap), "final_drain"
+        transferring = self._transferring_group_count(context)
+        if transferring and self.transfer_domain.total_debt == 0:
+            return 0, "transfer_backpressure"
+        # Reserve bounded export slots for every admitted group. Slow Reward or
+        # TQ may reduce actual Runtime occupancy, but cannot grow an unbounded
+        # completion queue. This is separate from the resident Prepare limit.
+        export_slots = (
+            target
+            + self.args.rollout_batch_size
+            - (
+                len(self._active_group_tasks)
+                + len(self._finalized_groups)
+                + transferring
+                + len(self.transfer_domain.pending_groups())
+            )
+        )
+        if export_slots <= 0:
+            return 0, "transfer_backpressure" if transferring else "completion_backpressure"
+        gap = min(max(0, target - self.runtime_domain.runtime_group_count), export_slots)
+        if gap == 0:
+            return 0, "target_reached"
+        warming, ready = self.prepare_domain.counts
+        if ready:
+            return gap, "none"
+        if self.runtime_domain.resident_group_count >= self.runtime_domain.concurrency:
+            return gap, "resident_capacity"
+        return gap, "prepare_warming" if warming else "prepare_not_ready"
+
+    async def _continue_generation_after_batch(self, context: _StepContext) -> bool:
+        """Keep ordinary boundaries open without bypassing the producer
+        fence."""
+        if self._runtime_target is None:
+            return False
+        if self._final_generation_step(context):
+            self._boundary_pause_reason = "final_drain"
+        elif get_local_rollout_manager().training_weight_updating or self.transfer_domain.total_debt:
+            self._boundary_pause_reason = "weight_update"
+        else:
+            # Use the same physical-partition criterion as Rollout._async_run.
+            # Between batches this producer cannot add another partition, and
+            # the Actor can only remove old ones, so admission cannot get worse.
+            steps = training_partition_steps(await self._data_system_client.async_get_partition_list())
+            if steps and context.rollout_id + 1 - min(steps) > self.args.max_staleness:
+                self._boundary_pause_reason = "staleness"
+            elif get_local_rollout_manager().training_weight_updating:
+                self._boundary_pause_reason = "weight_update"
+            else:
+                return True
+        self._refill_block_reason = self._boundary_pause_reason
+        return False
+
+    @staticmethod
+    def _transferring_group_count(context: _StepContext) -> int:
+        return sum(count for task, count in context.tq_group_counts.items() if not task.done())
+
+    def _scheduler_snapshot(self) -> dict[str, object]:
+        runtime = self.runtime_domain.runtime_group_count
+        warming, ready = self.prepare_domain.counts
+        finished = sum(task.done() for task in self._active_group_tasks)
+        complete = sum(
+            task.done() and not task.cancelled() and task.exception() is None and task.result() is not None
+            for task in self._active_group_tasks
+        )
+        context = self._active_step
+        reason = self._steady_refill_decision(context)[1] if context is not None else self._refill_block_reason
+        return {
+            "runtime_group_count": runtime,
+            "runtime_group_target": self._runtime_target,
+            "prepare_group_limit": getattr(self.args, "agentic_prepare_groups", 16),
+            "reward_inflight_group_count": max(0, len(self._active_group_tasks) - finished - runtime),
+            "completed_buffer_group_count": len(self._finalized_groups) + complete,
+            "completion_capacity_groups": self._runtime_target + self.args.rollout_batch_size,
+            "transfer_pending_group_count": len(self.transfer_domain.pending_groups()),
+            "resident_group_limit": self.runtime_domain.concurrency,
+            "refill_blocked_reason": reason,
+            "transferring_group_count": self._transferring_group_count(context) if context is not None else 0,
+            "warming_prepare_group_count": warming,
+            "ready_prepare_group_count": ready,
+        }
+
+    def _scheduler_metrics(self) -> dict[str, float]:
+        snapshot = self._scheduler_snapshot()
+        reason = snapshot.pop("refill_blocked_reason")
+        result = {f"agentic/scheduler/{key}": float(value) for key, value in snapshot.items()}
+        for candidate in (
+            "weight_update",
+            "staleness",
+            "transfer_backpressure",
+            "completion_backpressure",
+            "resident_capacity",
+            "prepare_warming",
+            "prepare_not_ready",
+            "target_reached",
+            "final_drain",
+        ):
+            result[f"agentic/scheduler/refill_blocked/{candidate}"] = float(reason == candidate)
+        return result
 
     async def _shutdown(self) -> None:
         """Cancel and join active-step TQ writes, then release every owner."""
@@ -831,6 +987,8 @@ class AgenticResidentPipeline:
                 break
         for task in tasks:
             self._finalized_groups.extend(tq_put_tasks.pop(task, []))
+        if self._active_step is not None:
+            self._active_step.tq_group_counts.clear()
 
         self.transfer_domain.clear()
         for cleanup in (

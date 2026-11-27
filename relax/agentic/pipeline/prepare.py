@@ -29,6 +29,13 @@ class PrepareDomain:
         self.data_source = data_source
         self.runtime_domain = runtime_domain
         self._prelaunch_next_step = False
+        args = getattr(runtime_domain, "args", None)
+        self._prepare_limit = (
+            getattr(args, "agentic_prepare_groups", 16)
+            if getattr(args, "agentic_runtime_groups", None) is not None
+            and getattr(runtime_domain, "rollout_mode", "train") == "train"
+            else None
+        )
         self._next_group_sequence = 0
         self._prepare_fetch_task: Optional[asyncio.Task[None]] = None
         self._pending_group_inputs: Deque[GroupInput] = deque()
@@ -58,6 +65,8 @@ class PrepareDomain:
 
     def fill(self, demand: int = 0) -> None:
         target = self.runtime_domain.concurrency if self._prelaunch_next_step else demand
+        if self._prepare_limit is not None:
+            target = self._prepare_limit if self._prelaunch_next_step else min(demand, self._prepare_limit)
         gap = target - sum(self.counts)
         while gap > 0 and self._pending_group_inputs:
             self._start_prepare(self._pending_group_inputs.popleft())
