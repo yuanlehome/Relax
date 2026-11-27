@@ -100,8 +100,9 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.close()
             return
         self.server.received.append(request)
-        if self.server.response_gate is not None:
-            self.server.response_gate.wait(timeout=8)
+        gate = getattr(self.server, "response_gates", {}).get(request.get("routed_dp_rank"), self.server.response_gate)
+        if gate is not None:
+            gate.wait(timeout=8)
         if self.server.disconnect:
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
@@ -129,7 +130,8 @@ class Handler(BaseHTTPRequestHandler):
 @pytest.fixture
 def router(tmp_path, request):
     regular = getattr(request, "param", None) == "regular"
-    pd_retry = getattr(request, "param", None) == "pd-retry"
+    session_policy = getattr(request, "param", None) == "session"
+    pd_retry = getattr(request, "param", None) in ("pd-retry", "session")
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text(
@@ -153,6 +155,7 @@ def router(tmp_path, request):
         worker = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         worker.daemon_threads = True
         worker.dp_size = 2 if pd_retry else 1
+        worker.session_policy = session_policy
         worker.response_finished = threading.Event()
         worker.close_connections = regular
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
@@ -185,6 +188,8 @@ def router(tmp_path, request):
     elif pd_retry:
         worker_args.remove("--disable-retries")
         worker_args.extend(["--dp-aware", "--retry-max-retries", "5"])
+    if session_policy:
+        worker_args.extend(["--decode-policy", "session_least_load"])
     command = [
         sys.executable,
         "-m",
@@ -243,7 +248,7 @@ def router(tmp_path, request):
                 thread.join(timeout=2)
 
 
-def generate(router, *, start=0, stream=False, batch=False, rid=None):
+def generate(router, *, start=0, stream=False, batch=False, rid=None, session=None):
     url, _ = router
     payload = {
         "input_ids": [[1, 2, 3], [1, 2, 3, 4, 5]] if batch else [1, 2, 3],
@@ -254,8 +259,14 @@ def generate(router, *, start=0, stream=False, batch=False, rid=None):
     }
     if rid is not None:
         payload["rid"] = rid
+    headers = {"Content-Type": "application/json"}
+    if session is None and getattr(router[1][0], "session_policy", False):
+        session = "fault-session"
+    if session:
+        headers["X-SMG-Routing-Key"] = session
+        payload["session_id"] = session
     return urlopen(
-        Request(url + "/generate", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}),
+        Request(url + "/generate", data=json.dumps(payload).encode(), headers=headers),
         timeout=12,
     )
 

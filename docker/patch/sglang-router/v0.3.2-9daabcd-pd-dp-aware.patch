@@ -1,10 +1,51 @@
+diff --git a/bindings/python/src/lib.rs b/bindings/python/src/lib.rs
+--- a/bindings/python/src/lib.rs
++++ b/bindings/python/src/lib.rs
+@@ -15,6 +15,7 @@
+     Manual,
+     ConsistentHashing,
+     PrefixHash,
++    SessionLeastLoad,
+ }
+ 
+ #[pyclass(eq)]
+@@ -432,6 +433,7 @@
+             match policy {
+                 PolicyType::Random => ConfigPolicyConfig::Random,
+                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
++                PolicyType::SessionLeastLoad => ConfigPolicyConfig::SessionLeastLoad,
+                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
+                     cache_threshold: self.cache_threshold,
+                     balance_abs_threshold: self.balance_abs_threshold,
+diff --git a/bindings/python/src/sglang_router/router.py b/bindings/python/src/sglang_router/router.py
+--- a/bindings/python/src/sglang_router/router.py
++++ b/bindings/python/src/sglang_router/router.py
+@@ -23,6 +23,7 @@
+     policy_map = {
+         "random": PolicyType.Random,
+         "round_robin": PolicyType.RoundRobin,
++        "session_least_load": PolicyType.SessionLeastLoad,
+         "cache_aware": PolicyType.CacheAware,
+         "power_of_two": PolicyType.PowerOfTwo,
+         "bucket": PolicyType.Bucket,
+diff --git a/bindings/python/src/sglang_router/router_args.py b/bindings/python/src/sglang_router/router_args.py
+--- a/bindings/python/src/sglang_router/router_args.py
++++ b/bindings/python/src/sglang_router/router_args.py
+@@ -282,6 +282,7 @@
+             choices=[
+                 "random",
+                 "round_robin",
++                "session_least_load",
+                 "cache_aware",
+                 "power_of_two",
+                 "manual",
 diff --git a/src/app_context.rs b/src/app_context.rs
 --- a/src/app_context.rs
 +++ b/src/app_context.rs
 @@ -328,13 +328,24 @@
          // backend to avoid unnecessary TLS initialization overhead.
          let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
-
+ 
 +        // Retire PD connections before SGLang's default five-second keep-alive.
 +        // Reusing a closing prefill connection can leave decode waiting for KV.
 +        let pool_idle_secs = if config.mode.is_pd_mode() { 4 } else { 50 };
@@ -24,14 +65,75 @@ diff --git a/src/app_context.rs b/src/app_context.rs
 +        {
 +            client_builder = client_builder.tcp_user_timeout(None);
 +        }
-
+ 
          // Force rustls backend when TLS is configured
          if has_tls_config {
+diff --git a/src/config/types.rs b/src/config/types.rs
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -229,6 +229,10 @@
+     #[serde(rename = "round_robin")]
+     RoundRobin,
+ 
++    /// HTTP PD decode placement with explicit session lifetime.
++    #[serde(rename = "session_least_load")]
++    SessionLeastLoad,
++
+     #[serde(rename = "cache_aware")]
+     CacheAware {
+         cache_threshold: f32,
+@@ -314,6 +318,7 @@
+         match self {
+             PolicyConfig::Random => "random",
+             PolicyConfig::RoundRobin => "round_robin",
++            PolicyConfig::SessionLeastLoad => "session_least_load",
+             PolicyConfig::CacheAware { .. } => "cache_aware",
+             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+             PolicyConfig::Bucket { .. } => "bucket",
+diff --git a/src/config/validation.rs b/src/config/validation.rs
+--- a/src/config/validation.rs
++++ b/src/config/validation.rs
+@@ -1,10 +1,26 @@
+ use super::*;
++use crate::core::ConnectionMode;
+ 
+ /// Configuration validator
+ pub(crate) struct ConfigValidator;
+ 
+ impl ConfigValidator {
+     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
++        // Session receipts and close control are implemented by HTTP PD only.
++        let (session_prefill, session_decode) = match &config.mode {
++            RoutingMode::PrefillDecode { prefill_policy, decode_policy, .. } => (
++                matches!(prefill_policy, Some(PolicyConfig::SessionLeastLoad)),
++                matches!(decode_policy, Some(PolicyConfig::SessionLeastLoad)),
++            ),
++            _ => (false, false),
++        };
++        if matches!(config.policy, PolicyConfig::SessionLeastLoad) || session_prefill
++            || (session_decode && (config.enable_igw || config.connection_mode != ConnectionMode::Http))
++        {
++            return Err(ConfigError::IncompatibleConfig {
++                reason: "session_least_load is supported only as the HTTP PD decode policy (without IGW)".into(),
++            });
++        }
+         Self::validate_mode(&config.mode)?;
+         Self::validate_policy(&config.policy)?;
+         Self::validate_server_settings(config)?;
+@@ -150,7 +166,8 @@
+             PolicyConfig::Random
+             | PolicyConfig::RoundRobin
+             | PolicyConfig::Manual { .. }
+-            | PolicyConfig::ConsistentHashing => {}
++            | PolicyConfig::ConsistentHashing
++            | PolicyConfig::SessionLeastLoad => {}
+             PolicyConfig::CacheAware {
+                 cache_threshold,
+                 balance_abs_threshold: _,
 diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
-index 9b55e31..36cfb45 100644
 --- a/src/core/worker_builder.rs
 +++ b/src/core/worker_builder.rs
-@@ -316,7 +316,13 @@ impl DPAwareWorkerBuilder {
+@@ -316,7 +316,13 @@
              builder = builder.api_key(api_key);
          }
  
@@ -46,11 +148,10 @@ index 9b55e31..36cfb45 100644
          DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
      }
  }
-@@ -431,6 +437,19 @@ mod tests {
-         );
+@@ -432,6 +438,19 @@
      }
  
-+    #[test]
+     #[test]
 +    fn test_dp_aware_bootstrap_host_uses_physical_url() {
 +        for (url, host) in [("http://127.0.0.1:8080", "127.0.0.1"), ("http://prefill:8080", "prefill")] {
 +            let worker = DPAwareWorkerBuilder::new(url, 1, 2)
@@ -63,11 +164,507 @@ index 9b55e31..36cfb45 100644
 +        }
 +    }
 +
-     #[test]
++    #[test]
      fn test_dp_aware_worker_builder_minimal() {
          let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
+ 
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -207,7 +207,7 @@
+     prefill_policy: Option<String>,
+ 
+     /// Specific policy for decode nodes in PD mode
+-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
++    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "session_least_load"], help_heading = "PD Disaggregation")]
+     decode_policy: Option<String>,
+ 
+     /// Timeout in seconds for worker startup and registration
+@@ -715,6 +715,7 @@
+ 
+     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
+         match policy_str {
++            "session_least_load" => PolicyConfig::SessionLeastLoad,
+             "random" => PolicyConfig::Random,
+             "round_robin" => PolicyConfig::RoundRobin,
+             "cache_aware" => PolicyConfig::CacheAware {
+diff --git a/src/policies/factory.rs b/src/policies/factory.rs
+--- a/src/policies/factory.rs
++++ b/src/policies/factory.rs
+@@ -5,7 +5,7 @@
+ use super::{
+     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
++    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SessionLeastLoadPolicy,
+ };
+ use crate::config::PolicyConfig;
+ 
+@@ -18,6 +18,7 @@
+         match config {
+             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
+             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
++            PolicyConfig::SessionLeastLoad => Arc::new(SessionLeastLoadPolicy::new()),
+             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+             PolicyConfig::CacheAware {
+                 cache_threshold,
+@@ -78,6 +79,7 @@
+         match name.to_lowercase().as_str() {
+             "random" => Some(Arc::new(RandomPolicy::new())),
+             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
++            "session_least_load" => Some(Arc::new(SessionLeastLoadPolicy::new())),
+             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+             "bucket" => Some(Arc::new(BucketPolicy::new())),
+diff --git a/src/policies/mod.rs b/src/policies/mod.rs
+--- a/src/policies/mod.rs
++++ b/src/policies/mod.rs
+@@ -20,6 +20,7 @@
+ mod random;
+ mod registry;
+ mod round_robin;
++mod session_least_load;
+ pub mod tree;
+ pub(crate) mod utils;
+ pub use bucket::BucketPolicy;
+@@ -32,6 +33,7 @@
+ pub use random::RandomPolicy;
+ pub use registry::PolicyRegistry;
+ pub use round_robin::RoundRobinPolicy;
++pub use session_least_load::{SessionLeastLoadPolicy, SessionRequest};
+ pub use tree::PrefixMatchResult;
+ 
+ /// Core trait for load balancing policies
+diff --git a/src/policies/session_least_load.rs b/src/policies/session_least_load.rs
+new file mode 100644
+--- /dev/null
++++ b/src/policies/session_least_load.rs
+@@ -0,0 +1,424 @@
++//! Session-scoped decode placement. Data requests reserve load before dispatch;
++//! bindings survive tool waits and are never moved on health changes or a TTL.
++use std::{
++    collections::HashMap,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc,
++    },
++};
++
++use async_trait::async_trait;
++use http::HeaderMap;
++use parking_lot::Mutex;
++use serde_json::{json, Value};
++
++use super::{LoadBalancingPolicy, SelectWorkerInfo};
++use crate::core::{Worker, WorkerLoadGuard};
++
++const MAX_ENTRIES: usize = 1_000_000;
++type Key = (String, String);
++
++#[derive(Debug)]
++struct Binding {
++    worker: Option<Arc<dyn Worker>>,
++    active: usize,
++    uncertain: usize,
++    closing: bool,
++}
++
++#[derive(Debug, Default)]
++struct WorkerCounts {
++    url: String,
++    bound: usize,
++    active: usize,
++    uncertain: usize,
++}
++
++#[derive(Debug, Default)]
++struct State {
++    bindings: HashMap<Key, Binding>,
++    workers: HashMap<usize, WorkerCounts>,
++    cursor: usize,
++    assignments: u64,
++    reuses: u64,
++    rejected: u64,
++}
++
++fn identity(worker: &Arc<dyn Worker>) -> usize {
++    Arc::as_ptr(worker) as *const () as usize
++}
++
++#[derive(Debug, Default)]
++pub struct SessionLeastLoadPolicy {
++    state: Arc<Mutex<State>>,
++}
++
++impl SessionLeastLoadPolicy {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn reserve(
++        &self,
++        workers: &[Arc<dyn Worker>],
++        model: &str,
++        session: &str,
++        headers: Option<&HeaderMap>,
++    ) -> Result<(Arc<dyn Worker>, SessionRequest), String> {
++        if session.is_empty() || session.len() > 512 {
++            return Err("invalid session routing key".into());
++        }
++        let key = (model.to_owned(), session.to_owned());
++        let mut state = self.state.lock();
++        let worker = if let Some(binding) = state.bindings.get(&key) {
++            if binding.closing || binding.uncertain > 0 {
++                state.rejected += 1;
++                return Err("session binding is closed or cleanup is unconfirmed".into());
++            }
++            let assigned = binding.worker.as_ref().expect("open binding owns worker");
++            // URL equality alone must not silently transfer ownership to a new
++            // worker incarnation registered at the same address.
++            if !workers
++                .iter()
++                .any(|w| Arc::ptr_eq(w, assigned) && w.is_available())
++            {
++                state.rejected += 1;
++                return Err(
++                    "bound decode worker is unavailable; automatic migration is disabled".into(),
++                );
++            }
++            let worker = assigned.clone();
++            state.reuses += 1;
++            worker
++        } else {
++            if state.bindings.len() >= MAX_ENTRIES {
++                state.rejected += 1;
++                return Err("session routing table capacity reached".into());
++            }
++            let mut candidates: Vec<_> = workers
++                .iter()
++                .filter(|w| w.is_available())
++                .cloned()
++                .collect();
++            candidates.sort_by(|a, b| a.url().cmp(b.url()));
++            if candidates.is_empty() {
++                return Err("no available decode worker".into());
++            }
++            let cursor = state.cursor % candidates.len();
++            let index = (0..candidates.len())
++                .min_by_key(|&i| {
++                    let worker = &candidates[i];
++                    let counts = state.workers.get(&identity(worker));
++                    (
++                        worker
++                            .load()
++                            .saturating_add(counts.map_or(0, |c| c.uncertain)),
++                        counts.map_or(0, |c| c.bound),
++                        (i + candidates.len() - cursor) % candidates.len(),
++                    )
++                })
++                .expect("nonempty candidates");
++            state.cursor = index + 1;
++            let worker = candidates[index].clone();
++            state
++                .workers
++                .entry(identity(&worker))
++                .or_insert_with(|| WorkerCounts {
++                    url: worker.url().to_string(),
++                    ..Default::default()
++                })
++                .bound += 1;
++            state.bindings.insert(
++                key.clone(),
++                Binding {
++                    worker: Some(worker.clone()),
++                    active: 0,
++                    uncertain: 0,
++                    closing: false,
++                },
++            );
++            state.assignments += 1;
++            worker
++        };
++        state.bindings.get_mut(&key).expect("binding exists").active += 1;
++        state
++            .workers
++            .get_mut(&identity(&worker))
++            .expect("worker exists")
++            .active += 1;
++        // Increment the actual Router worker load while holding the placement
++        // lock: simultaneous first turns cannot all observe the same empty DP.
++        let load = WorkerLoadGuard::new(worker.clone(), headers);
++        let request = SessionRequest(Arc::new(RequestInner {
++            state: self.state.clone(),
++            key,
++            worker_id: identity(&worker),
++            dispatched: AtomicBool::new(false),
++            terminal: AtomicBool::new(false),
++            _load: load,
++        }));
++        Ok((worker, request))
++    }
++
++    pub fn close(&self, model: &str, session: &str) -> Result<Value, String> {
++        if session.is_empty() || session.len() > 512 {
++            return Err("invalid session routing key".into());
++        }
++        let key = (model.to_owned(), session.to_owned());
++        let mut state = self.state.lock();
++        if !state.bindings.contains_key(&key) && state.bindings.len() >= MAX_ENTRIES {
++            return Err("session routing table capacity reached".into());
++        }
++        // Keep a compact tombstone for this Router's lifetime. A delayed first
++        // request must not reopen a closed session. No idle TTL moves live sessions.
++        state
++            .bindings
++            .entry(key.clone())
++            .or_insert(Binding {
++                worker: None,
++                active: 0,
++                uncertain: 0,
++                closing: true,
++            })
++            .closing = true;
++        Self::release_closed(&mut state, &key);
++        let binding = &state.bindings[&key];
++        Ok(json!({
++            "sealed": true, "active_requests": binding.active,
++            "cleanup_unconfirmed": binding.uncertain,
++            "binding_released": binding.worker.is_none(),
++            "physical_cleanup_confirmed": false
++        }))
++    }
++
++    fn release_closed(state: &mut State, key: &Key) {
++        let binding = state.bindings.get_mut(key).expect("binding exists");
++        if binding.closing && binding.active == 0 && binding.uncertain == 0 {
++            if let Some(worker) = binding.worker.take() {
++                let id = identity(&worker);
++                let counts = state.workers.get_mut(&id).expect("worker counts exist");
++                counts.bound -= 1;
++                if counts.bound == 0 && counts.uncertain == 0 {
++                    state.workers.remove(&id);
++                }
++            }
++        }
++    }
++
++    pub fn snapshot(&self) -> Value {
++        let state = self.state.lock();
++        let per_worker: Vec<_> = state.workers.values().map(|w| json!({
++            "worker": w.url, "bound_sessions": w.bound, "active_requests": w.active, "cleanup_unconfirmed": w.uncertain,
++        })).collect();
++        json!({
++            "policy": "session_least_load",
++            "open_bindings": state.bindings.values().filter(|b| !b.closing).count(),
++            "closing_bindings": state.bindings.values().filter(|b| b.closing && b.worker.is_some()).count(),
++            "closed_tombstones": state.bindings.values().filter(|b| b.worker.is_none()).count(),
++            "active_requests": state.bindings.values().map(|b| b.active).sum::<usize>(),
++            "cleanup_unconfirmed": state.bindings.values().map(|b| b.uncertain).sum::<usize>(),
++            "assignments": state.assignments, "reuses": state.reuses, "rejected": state.rejected,
++            "max_entries": MAX_ENTRIES, "workers": per_worker,
++        })
++    }
++}
++
++#[derive(Clone)]
++pub struct SessionRequest(Arc<RequestInner>);
++
++struct RequestInner {
++    state: Arc<Mutex<State>>,
++    key: Key,
++    worker_id: usize,
++    dispatched: AtomicBool,
++    terminal: AtomicBool,
++    _load: WorkerLoadGuard,
++}
++
++impl SessionRequest {
++    pub fn dispatched(&self) {
++        self.0.dispatched.store(true, Ordering::Release);
++    }
++    pub fn terminal(&self) {
++        self.0.terminal.store(true, Ordering::Release);
++    }
++}
++
++impl Drop for RequestInner {
++    fn drop(&mut self) {
++        let mut state = self.state.lock();
++        let uncertain =
++            self.dispatched.load(Ordering::Acquire) && !self.terminal.load(Ordering::Acquire);
++        let binding = state
++            .bindings
++            .get_mut(&self.key)
++            .expect("request owns binding");
++        binding.active -= 1;
++        if uncertain {
++            binding.uncertain += 1;
++            state
++                .workers
++                .get_mut(&self.worker_id)
++                .expect("request owns worker")
++                .uncertain += 1;
++        }
++        state
++            .workers
++            .get_mut(&self.worker_id)
++            .expect("worker exists")
++            .active -= 1;
++        SessionLeastLoadPolicy::release_closed(&mut state, &self.key);
++        // WorkerLoadGuard drops after this lock is released.
++    }
++}
++
++#[async_trait]
++impl LoadBalancingPolicy for SessionLeastLoadPolicy {
++    async fn select_worker(
++        &self,
++        workers: &[Arc<dyn Worker>],
++        info: &SelectWorkerInfo<'_>,
++    ) -> Option<usize> {
++        // Anonymous health probes have no session. Generation must use reserve()
++        // in the HTTP PD path, which owns the terminal-response receipt.
++        if info
++            .headers
++            .is_some_and(|h| h.contains_key("x-smg-routing-key"))
++        {
++            return None;
++        }
++        workers
++            .iter()
++            .enumerate()
++            .filter(|(_, w)| w.is_available())
++            .min_by_key(|(_, w)| w.load())
++            .map(|(i, _)| i)
++    }
++    fn name(&self) -> &'static str {
++        "session_least_load"
++    }
++    fn as_any(&self) -> &dyn std::any::Any {
++        self
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::core::{DPAwareWorkerBuilder, WorkerType};
++    fn workers() -> Vec<Arc<dyn Worker>> {
++        (0..12)
++            .map(|i| {
++                Arc::new(
++                    DPAwareWorkerBuilder::new(format!("http://d{}:8000", i / 2), i % 2, 2)
++                        .worker_type(WorkerType::Decode)
++                        .build(),
++                ) as Arc<dyn Worker>
++            })
++            .collect()
++    }
++    #[test]
++    fn concurrent_first_turns_reserve_atomically_across_twelve_dps() {
++        let policy = Arc::new(SessionLeastLoadPolicy::new());
++        let workers = workers();
++        let gate = Arc::new(std::sync::Barrier::new(97));
++        let mut handles = vec![];
++        for i in 0..96 {
++            let (policy, workers, gate) = (policy.clone(), workers.clone(), gate.clone());
++            handles.push(std::thread::spawn(move || {
++                gate.wait();
++                policy
++                    .reserve(&workers, "m", &format!("s{i}"), None)
++                    .unwrap()
++            }));
++        }
++        gate.wait();
++        let reservations: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
++        assert!(workers.iter().all(|w| w.load() == 8));
++        assert_eq!(policy.snapshot()["active_requests"], 96);
++        drop(reservations); // never dispatched: no quarantine
++        assert!(workers.iter().all(|w| w.load() == 0));
++        assert_eq!(policy.snapshot()["cleanup_unconfirmed"], 0);
++    }
++    #[test]
++    fn sticky_across_idle_and_health_changes_but_not_worker_incarnations() {
++        let policy = SessionLeastLoadPolicy::new();
++        let workers = workers();
++        let (first, receipt) = policy.reserve(&workers, "m", "s", None).unwrap();
++        receipt.dispatched();
++        receipt.terminal();
++        drop(receipt);
++        // Artificial load does not move an existing binding.
++        first.increment_load();
++        let (again, receipt) = policy.reserve(&workers, "m", "s", None).unwrap();
++        assert!(Arc::ptr_eq(&first, &again));
++        drop(receipt);
++        first.decrement_load();
++        first.set_healthy(false);
++        assert!(policy.reserve(&workers, "m", "s", None).is_err());
++        first.set_healthy(true);
++        assert!(policy.reserve(&self::workers(), "m", "s", None).is_err());
++        assert!(policy.reserve(&workers, "m", "s", None).is_ok());
++    }
++    #[test]
++    fn idle_binding_count_breaks_equal_load_ties_and_close_seals_late_requests() {
++        let policy = SessionLeastLoadPolicy::new();
++        let workers = workers();
++        let mut selected = std::collections::HashSet::new();
++        for i in 0..12 {
++            let (worker, receipt) = policy
++                .reserve(&workers, "m", &format!("s{i}"), None)
++                .unwrap();
++            selected.insert(worker.url().to_string());
++            receipt.dispatched();
++            receipt.terminal();
++            drop(receipt);
++        }
++        assert_eq!(selected.len(), 12);
++        assert_eq!(policy.close("m", "s0").unwrap()["binding_released"], true);
++        assert!(policy.reserve(&workers, "m", "s0", None).is_err());
++        policy.close("m", "late-first").unwrap();
++        assert!(policy.reserve(&workers, "m", "late-first", None).is_err());
++    }
++    #[test]
++    fn close_race_waits_for_terminal_receipt_and_abort_ack_cannot_release_uncertainty() {
++        let policy = SessionLeastLoadPolicy::new();
++        let workers = workers();
++        let (_, receipt) = policy.reserve(&workers, "m", "ok", None).unwrap();
++        receipt.dispatched();
++        assert_eq!(policy.close("m", "ok").unwrap()["binding_released"], false);
++        assert!(policy.reserve(&workers, "m", "ok", None).is_err());
++        receipt.terminal();
++        drop(receipt);
++        assert_eq!(policy.close("m", "ok").unwrap()["binding_released"], true);
++        let (_, receipt) = policy.reserve(&workers, "m", "unknown", None).unwrap();
++        receipt.dispatched();
++        drop(receipt);
++        assert!(policy.reserve(&workers, "m", "unknown", None).is_err());
++        for _ in 0..3 {
++            let ack = policy.close("m", "unknown").unwrap();
++            assert_eq!(ack["sealed"], true);
++            assert_eq!(ack["binding_released"], false);
++            assert_eq!(ack["cleanup_unconfirmed"], 1);
++            assert_eq!(ack["physical_cleanup_confirmed"], false);
++        }
++        assert!(workers.iter().all(|w| w.load() == 0));
++    }
++    #[test]
++    fn namespace_and_primary_load_override_bound_session_ties() {
++        let policy = SessionLeastLoadPolicy::new();
++        let workers = workers();
++        for w in &workers[..11] {
++            w.increment_load();
++        }
++        let (picked, receipt) = policy.reserve(&workers, "a", "same", None).unwrap();
++        assert!(Arc::ptr_eq(&picked, &workers[11]));
++        drop(receipt);
++        policy.close("a", "same").unwrap();
++        assert!(policy.reserve(&workers, "b", "same", None).is_ok());
++        for w in &workers[..11] {
++            w.decrement_load();
++        }
++    }
++}
 diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
-index 3f31b6f..b2c9b08 100644
 --- a/src/routers/http/mod.rs
 +++ b/src/routers/http/mod.rs
 @@ -1,5 +1,43 @@
@@ -124,7 +721,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +    sync::Arc,
 +    time::{Duration, Instant},
 +};
-
+ 
  use async_trait::async_trait;
  use axum::{
 @@ -10,16 +14,16 @@
@@ -140,16 +737,25 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  use serde_json::{json, Value};
  use tokio_stream::wrappers::UnboundedReceiverStream;
  use tracing::{debug, error, warn};
-
+ 
 -use super::pd_types::api_path;
 +use super::{pd_routing, pd_types::api_path};
  use crate::{
      config::types::RetryConfig,
      core::{
+@@ -31,7 +35,7 @@
+         metrics::{bool_to_static_str, metrics_labels, Metrics},
+         otel_trace::inject_trace_context_http,
+     },
+-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
++    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, SessionLeastLoadPolicy, SessionRequest},
+     protocols::{
+         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+         classify::ClassifyRequest,
 @@ -48,6 +52,11 @@
      },
  };
-
+ 
 +// Once either side may have received a request, retrying the RID is unsafe.
 +// This marker also covers transport failures and unconfirmed cancellation.
 +#[derive(Clone, Copy, Debug)]
@@ -164,27 +770,59 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let workers = self.worker_registry.get_prefill_workers();
 -        let first_worker_url = workers.first().map(|w| w.url().to_string());
 +        let first_worker_url = workers.first().map(|w| w.base_url().to_string());
-
+ 
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -368,7 +377,7 @@
+@@ -312,6 +321,11 @@
+         let route = context.route;
+         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+         let endpoint = route_to_endpoint(route);
++        if self.policy_registry.get_decode_policy().name() == "session_least_load"
++            && header_utils::extract_routing_key(headers).is_none_or(|key| key.is_empty() || key.len() > 512)
++        {
++            return error::bad_request("missing_session_routing_key", "session_least_load requires X-SMG-Routing-Key");
++        }
+ 
+         // Record request start (Layer 2)
+         Metrics::record_router_request(
+@@ -333,7 +347,7 @@
+                     let shared_request = Arc::clone(&shared_request);
+                     let context = context.clone();
+                     async move {
+-                        let (prefill, decode) = match self
++                        let (prefill, decode, session_request) = match self
+                             .select_pd_pair(
+                                 context.request_text.as_deref(),
+                                 context.model_id,
+@@ -368,7 +382,9 @@
                              Err(e) => return Self::handle_serialization_error(e),
                          };
-
+ 
 -                        let response = self
++                        let is_stream = context.is_stream;
++                        if let Some(ref receipt) = session_request { receipt.dispatched(); }
 +                        let mut response = self
                              .execute_dual_dispatch_internal(
                                  headers,
                                  json_request,
-@@ -378,6 +387,7 @@
+@@ -376,8 +392,16 @@
+                                 Arc::clone(&prefill),
+                                 Arc::clone(&decode),
                                  start_time,
++                                session_request.clone(),
                              )
                              .await;
++                        if (!is_stream || !response.status().is_success())
++                            && response.status().as_u16() != 424
++                            && response.headers().get("x-sglang-pd-cleanup").is_none()
++                        {
++                            if let Some(ref receipt) = session_request { receipt.terminal(); }
++                        }
 +                        response.extensions_mut().insert(PDDispatched);
-
+ 
                          let status = response.status();
                          let not_error = status.is_success() || status.is_client_error();
-@@ -403,7 +413,10 @@
+@@ -403,7 +427,10 @@
                      }
                  }
              },
@@ -196,7 +834,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              |delay, attempt| {
                  // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                  Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-@@ -428,7 +441,9 @@
+@@ -428,7 +455,9 @@
                  endpoint,
                  duration,
              );
@@ -207,7 +845,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              Metrics::record_router_error(
                  metrics_labels::ROUTER_HTTP,
                  metrics_labels::BACKEND_PD,
-@@ -480,6 +495,7 @@
+@@ -480,10 +509,12 @@
                  None,
                  context.return_logprob,
                  false,
@@ -215,10 +853,15 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +573,513 @@
+                 decode,
++                None,
+             )
+         } else {
+             // Handle non-streaming error response
+@@ -557,6 +588,513 @@
          }
      }
-
+ 
 +    // Keep physical endpoints separate from virtual DP identities. Preserve the raw
 +    // request so native extensions such as routed_experts survive the round trip.
 +    fn prepare_dp_requests(
@@ -729,10 +1372,24 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +1101,30 @@
+@@ -566,32 +1104,43 @@
+         prefill: Arc<dyn Worker>,
+         decode: Arc<dyn Worker>,
+         _start_time: Instant,
++        session_request: Option<SessionRequest>,
+     ) -> Response {
+         // For non-streaming: use guard for automatic load management
+         // For streaming: load will be managed in create_streaming_response
+         let _prefill_guard =
+             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+         let _decode_guard =
+-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
++            (!context.is_stream && session_request.is_none()).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+ 
+         let mut headers_with_trace = headers.cloned().unwrap_or_default();
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
-
+ 
 -        // Build both requests
 +        // Build both requests with their independently selected DP owners.
 +        let routed_start = (context.route == "/generate"
@@ -765,10 +1422,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              headers,
              false,
          );
-@@ -604,10 +1137,110 @@
+@@ -604,10 +1153,110 @@
          }
          .emit();
-
+ 
 -        let (prefill_result, decode_result) =
 -            tokio::join!(prefill_request.send(), decode_request.send());
 +        let merge_prefill_meta = context.route == "/generate";
@@ -847,7 +1504,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +            },
 +        };
 +        let (decode_result, decode_aborted, _) = decode_result;
-
+ 
          events::RequestReceivedEvent {}.emit();
 +
 +        let prefill_body = match prefill_result {
@@ -875,13 +1532,13 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +            return Self::native_abort_response(decode_result.expect("known PD abort response"))
 +                .await;
 +        }
-
+ 
          // Process decode response
          match decode_result {
-@@ -628,23 +1261,13 @@
+@@ -628,23 +1277,13 @@
                          .await;
                  }
-
+ 
 -                let merge_prefill_meta = context.route == "/generate";
 -                let capture_prefill_body = context.return_logprob || merge_prefill_meta;
 -                let prefill_body = match self
@@ -903,7 +1560,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                      } else {
                          None
                      };
-@@ -657,6 +1280,7 @@
+@@ -657,10 +1296,12 @@
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -911,7 +1568,12 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +1293,7 @@
+                         decode,
++                        session_request,
+                     )
+                 } else {
+                     // Non-streaming response
+@@ -669,6 +1310,7 @@
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -919,7 +1581,50 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          prefill_body,
                      )
                      .await
-@@ -830,6 +1455,7 @@
+@@ -696,7 +1338,7 @@
+         request_text: Option<&str>,
+         model_id: Option<&str>,
+         headers: Option<&HeaderMap>,
+-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
++    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, Option<SessionRequest>), String> {
+         let effective_model_id = if !self.enable_igw { None } else { model_id };
+ 
+         debug!(
+@@ -744,6 +1386,15 @@
+         )
+         .await?;
+ 
++        let (decode, session_request) = if let (Some(policy), Some(session)) = (
++            decode_policy.as_any().downcast_ref::<SessionLeastLoadPolicy>(),
++            header_utils::extract_routing_key(headers),
++        ) {
++            let (worker, receipt) = policy.reserve(
++                &decode_workers, effective_model_id.unwrap_or(UNKNOWN_MODEL_ID), session, headers,
++            )?;
++            (worker, Some(receipt))
++        } else {
+         let decode = Self::pick_worker_by_policy_arc(
+             &decode_workers,
+             &*decode_policy,
+@@ -753,6 +1404,8 @@
+             "decode",
+         )
+         .await?;
++        (decode, None)
++        };
+ 
+         // Record worker selection metrics (Layer 3)
+         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+@@ -769,7 +1422,7 @@
+             decode_policy.name(),
+         );
+ 
+-        Ok((prefill, decode))
++        Ok((prefill, decode, session_request))
+     }
+ 
+     async fn pick_worker_by_policy_arc(
+@@ -830,10 +1483,12 @@
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -927,8 +1632,13 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,39 +1467,43 @@
-
+         decode: Arc<dyn Worker>,
++        session_request: Option<SessionRequest>,
+     ) -> Response {
+         use crate::core::AttachedBody;
+ 
+@@ -841,49 +1496,56 @@
+ 
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
 +            let mut buffer = pd_routing::SseBuffer::default();
@@ -983,6 +1693,9 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                                let _ = tx.send(Err("PD routing replay stream ended without complete routes".to_string()));
 +                                return;
 +                            }
++                            if done {
++                                if let Some(ref receipt) = session_request { receipt.terminal(); }
++                            }
 +                            if tx.send(Ok(event)).is_err() || done { return; }
 +                        }
 +                        Err(error) => { let _ = tx.send(Err(error)); return; }
@@ -996,8 +1709,22 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                let _ = tx.send(Ok(tail));
              }
          });
-
-@@ -914,6 +1544,7 @@
+ 
+         let stream = UnboundedReceiverStream::new(rx);
+         let body = Body::from_stream(stream);
+ 
+-        let guards = vec![
+-            WorkerLoadGuard::new(prefill, headers.as_ref()),
+-            WorkerLoadGuard::new(decode, headers.as_ref()),
+-        ];
++        let mut guards = vec![WorkerLoadGuard::new(prefill, headers.as_ref())];
++        if self.policy_registry.get_decode_policy().name() != "session_least_load" {
++            guards.push(WorkerLoadGuard::new(decode, headers.as_ref()));
++        }
+ 
+         let mut response = Response::new(body);
+         *response.status_mut() = status;
+@@ -914,6 +1576,7 @@
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -1005,9 +1732,9 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1565,9 @@
+@@ -934,6 +1597,9 @@
          }
-
+ 
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
 +            if routed_start.is_some() {
 +                return error::bad_gateway("invalid_routing_replay", "Invalid decode JSON for PD routing replay");
@@ -1015,7 +1742,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1585,18 @@
+@@ -951,14 +1617,18 @@
                          None
                      }
                  });
@@ -1038,7 +1765,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1629,24 @@
+@@ -991,24 +1661,24 @@
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
@@ -1058,7 +1785,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                    error = ?e,
 +                    "Prefill HTTP request failed"
                  );
-
+ 
 -                // Return error immediately - don't wait for decode to timeout
                  return Err(error::bad_gateway(
                      "prefill_server_error",
@@ -1070,8 +1797,8 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  ));
              }
          };
-@@ -1018,11 +1656,33 @@
-
+@@ -1018,11 +1688,33 @@
+ 
          // Check if prefill succeeded
          if !prefill_status.is_success() {
 +            error!(
@@ -1105,11 +1832,11 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                )
 +                    .into_response());
 +            }
-
+ 
              error!(
                  "Prefill server returned error status prefill_url={} status={} body={}",
-@@ -1061,18 +1721,31 @@
-
+@@ -1061,18 +1753,31 @@
+ 
          let prefill_body = if capture_body {
              match prefill_response.bytes().await {
 -                Ok(body) => Some(body),
@@ -1145,7 +1872,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              }
              None
          };
-@@ -1111,6 +1784,18 @@
+@@ -1111,6 +1816,18 @@
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -1164,10 +1891,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1825,6 @@
+@@ -1140,27 +1857,6 @@
              }
          }
-
+ 
 -        if let Some(prefill_routed) = prefill_meta.and_then(|meta| meta.get("routed_experts")) {
 -            if let Some(decode_routed) = decode_meta.get_mut("routed_experts") {
 -                if Self::merge_base64_int32_meta_field(
@@ -1192,10 +1919,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1839,6 @@
+@@ -1175,44 +1871,6 @@
          changed
      }
-
+ 
 -    fn merge_base64_int32_meta_field(
 -        prefill_value: &Value,
 -        decode_value: &mut Value,
@@ -1237,7 +1964,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1849,19 @@
+@@ -1223,31 +1881,19 @@
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
@@ -1278,11 +2005,20 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        Ok(bytes::Bytes::from(merged))
      }
  }
-
-@@ -1271,11 +1885,11 @@
+ 
+@@ -1261,7 +1907,7 @@
+         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
+ 
+         // Select a random worker pair using the policy
+-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
++        let (prefill, decode, _) = match self.select_pd_pair(None, None, None).await {
+             Ok(pair) => pair,
+             Err(e) => {
+                 return error::service_unavailable(
+@@ -1271,11 +1917,11 @@
              }
          };
-
+ 
 -        let prefill_url = format!("{}/health_generate", prefill.url());
 +        let prefill_url = format!("{}/health_generate", prefill.base_url());
          let (prefill_result, decode_result) = tokio::join!(
@@ -1292,11 +2028,12 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                .get(format!("{}/health_generate", decode.base_url()))
                  .send()
          );
-
-@@ -1523,6 +2137,36 @@
+ 
+@@ -1522,6 +2168,36 @@
+ mod tests {
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
-
++
 +    #[test]
 +    fn test_pd_dp_requests_select_independent_owners() {
 +        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
@@ -1326,11 +2063,28 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        assert_eq!(p, request);
 +        assert_eq!(d, request);
 +    }
-+
+ 
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
-         let policy_registry =
-@@ -1635,7 +2279,6 @@
+@@ -1588,7 +2264,7 @@
+         let result = router.select_pd_pair(None, None, None).await;
+ 
+         assert!(result.is_ok());
+-        let (prefill, _decode) = result.unwrap();
++        let (prefill, _decode, _session_request) = result.unwrap();
+ 
+         assert_eq!(prefill.url(), "http://healthy");
+         assert!(prefill.is_healthy());
+@@ -1601,7 +2277,7 @@
+         let result = router.select_pd_pair(None, None, None).await;
+ 
+         assert!(result.is_err());
+-        assert!(result.unwrap_err().contains("No prefill workers available"));
++        assert!(result.err().unwrap().contains("No prefill workers available"));
+     }
+ 
+     #[test]
+@@ -1635,7 +2311,6 @@
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -1338,7 +2092,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +2292,8 @@
+@@ -1649,6 +2324,8 @@
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -1347,7 +2101,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +2304,9 @@
+@@ -1659,7 +2336,9 @@
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -1357,16 +2111,16 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                "routed_experts": b64_i32(&[99, 99, 99, 99, 5, 6, 7, 8]),
              }
          });
-
-@@ -1670,6 +2317,7 @@
+ 
+@@ -1670,6 +2349,7 @@
              true,
          ));
-
+ 
 +        pd_routing::merge_routed_experts(Some(&prefill_meta), &mut decode_json, Some(0)).unwrap();
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +2356,24 @@
+@@ -1708,21 +2388,24 @@
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -1382,7 +2136,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                "completion_tokens": 1,
              }
          });
-
+ 
 -        assert!(PDRouter::merge_prefill_meta_in_json(
 +        assert!(pd_routing::merge_routed_experts(
              Some(&prefill_meta),
@@ -1392,10 +2146,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 -        ));
 +            Some(0),
 +        ).unwrap());
-
+ 
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +2436,7 @@
+@@ -1785,7 +2468,7 @@
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -1403,8 +2157,8 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +            vec![21, 22]
          );
      }
-
-@@ -1817,6 +2468,7 @@
+ 
+@@ -1817,9 +2500,11 @@
              false,
              false,
              None,
@@ -1412,17 +2166,23 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +2522,7 @@
++            None,
+         );
+ 
+         assert!(response.headers().get(CONTENT_LENGTH).is_none());
+@@ -1870,8 +2555,10 @@
                  false,
                  None,
                  None,
 +                None,
                  prefill_ref.clone(),
                  decode_ref.clone(),
++                None,
              );
+ 
+             // Guards are now attached to response body, so load should be 1
 diff --git a/src/routers/http/pd_routing.rs b/src/routers/http/pd_routing.rs
 new file mode 100644
-index 0000000..283023d
 --- /dev/null
 +++ b/src/routers/http/pd_routing.rs
 @@ -0,0 +1,161 @@
@@ -1588,23 +2348,22 @@ index 0000000..283023d
 +    Ok((Bytes::from(output), Some(index), false))
 +}
 diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
-index 72f0047..3b18123 100644
 --- a/src/routers/http/router.rs
 +++ b/src/routers/http/router.rs
-@@ -13,6 +13,12 @@ use serde_json::Value;
+@@ -12,6 +12,12 @@
+ use serde_json::Value;
  use tokio_stream::wrappers::UnboundedReceiverStream;
  use tracing::{debug, error};
- 
++
 +#[derive(Clone)]
 +struct NativeRequestAbort;
 +
 +#[derive(Clone)]
 +struct WorkerDispatched;
-+
+ 
  use crate::{
      app_context::AppContext,
-     config::types::RetryConfig,
-@@ -253,7 +259,13 @@ impl Router {
+@@ -253,7 +259,13 @@
                  res
              },
              // should_retry predicate
@@ -1619,7 +2378,7 @@ index 72f0047..3b18123 100644
              // on_backoff hook
              |delay, attempt| {
                  // Layer 3 worker metrics
-@@ -342,7 +354,10 @@ impl Router {
+@@ -342,7 +354,10 @@
          events::RequestReceivedEvent {}.emit();
  
          let status = response.status();
@@ -1631,7 +2390,7 @@ index 72f0047..3b18123 100644
  
          // Record worker errors for server errors (5xx)
          if status.is_server_error() {
-@@ -592,22 +607,34 @@ impl Router {
+@@ -592,22 +607,34 @@
                      worker_url, route, e
                  );
  
@@ -1669,7 +2428,7 @@ index 72f0047..3b18123 100644
                      response
                  }
                  Err(e) => {
-@@ -658,7 +685,9 @@ impl Router {
+@@ -658,7 +685,9 @@
                  response = AttachedBody::wrap_response(response, guard);
              }
              response
@@ -1680,3 +2439,50 @@ index 72f0047..3b18123 100644
      }
  
      async fn build_rerank_response(
+diff --git a/src/server.rs b/src/server.rs
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -416,6 +416,34 @@
+         &item_id,
+     )
+     .await
++}
++
++// This is a routing seal, never a claim that worker abort/cache cleanup ended.
++#[derive(Deserialize)]
++struct SessionRouteClose { session_id: String }
++
++async fn close_session_route(
++    State(state): State<Arc<AppState>>, Json(request): Json<SessionRouteClose>,
++) -> Response {
++    let policy = state.context.policy_registry.get_decode_policy();
++    let Some(policy) = policy.as_any().downcast_ref::<crate::policies::SessionLeastLoadPolicy>() else {
++        return (StatusCode::CONFLICT, Json(json!({"error": "session_least_load is not enabled"}))).into_response();
++    };
++    match policy.close(crate::core::UNKNOWN_MODEL_ID, &request.session_id) {
++        Ok(value) => {
++            let status = if value["binding_released"] == true { StatusCode::OK } else { StatusCode::ACCEPTED };
++            (status, Json(value)).into_response()
++        }
++        Err(reason) => (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response(),
++    }
++}
++
++async fn session_routes(State(state): State<Arc<AppState>>) -> Response {
++    let policy = state.context.policy_registry.get_decode_policy();
++    match policy.as_any().downcast_ref::<crate::policies::SessionLeastLoadPolicy>() {
++        Some(policy) => Json(policy.snapshot()).into_response(),
++        None => (StatusCode::CONFLICT, Json(json!({"error": "session_least_load is not enabled"}))).into_response(),
++    }
+ }
+ 
+ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+@@ -625,6 +653,8 @@
+     let admin_routes = Router::new()
+         .route("/flush_cache", post(flush_cache))
+         .route("/get_loads", get(get_loads))
++        .route("/session_routes", get(session_routes))
++        .route("/session_routes/close", post(close_session_route))
+         .route("/parse/function_call", post(parse_function_call))
+         .route("/parse/reasoning", post(parse_reasoning))
+         .route("/wasm", post(add_wasm_module))

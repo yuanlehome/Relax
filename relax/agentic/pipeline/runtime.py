@@ -582,8 +582,11 @@ class SGLangBackendAdapter:
     """Shard-owned SGLang compiler and HTTP capability."""
 
     def __init__(self, args: Namespace) -> None:
-        init_http_client(args)
         self._args = args
+        self._session_lifecycle = args.agentic_session_lifecycle
+        if getattr(args, "router_decode_policy", None) == "session_least_load" and not self._session_lifecycle:
+            raise ValueError("session_least_load requires agentic_session_lifecycle for binding cleanup")
+        init_http_client(args)
         self._native_replay = None
         if replay_dir := getattr(args, "agentic_native_replay_dir", None):
             from relax.agentic.native_replay import NativeReplayRecorder
@@ -592,7 +595,6 @@ class SGLangBackendAdapter:
         self._resources = load_agentic_compiler_resources(args)
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
-        self._session_lifecycle = args.agentic_session_lifecycle
         self._requests: dict[str, _BackendAttempt] = {}
         self._session_endpoints: dict[str, set[str]] = {}
         # Worker discovery and cleanup must not queue behind routed generation.
@@ -662,7 +664,11 @@ class SGLangBackendAdapter:
             if session_id:
                 self._session_endpoints.setdefault(session_id, set()).add(engine_url)
         headers = None
-        if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
+        if session_id and (
+            self._args.sglang_router_policy == "consistent_hashing"
+            or self._args.slime_router_sticky
+            or getattr(self._args, "router_decode_policy", None) == "session_least_load"
+        ):
             headers = {"X-SMG-Routing-Key": session_id}
         recorder = getattr(self, "_native_replay", None)
         capture_seq = (
@@ -737,10 +743,22 @@ class SGLangBackendAdapter:
         meta_info = dict(output["meta_info"])
         # A sealed body must survive parsing only if its manifest reaches the Session.
         with producer.response(meta_info, evaluation=evaluation):
-            return self._parse_result(output, meta_info, elapsed, sc_sampling_mode)
+            return self._parse_result(
+                output,
+                meta_info,
+                elapsed,
+                sc_sampling_mode,
+                has_multimodal_inputs=bool(image_data or audio_data or video_data),
+            )
 
     def _parse_result(
-        self, output: dict, meta_info: dict, elapsed: float, sc_sampling_mode: str | None
+        self,
+        output: dict,
+        meta_info: dict,
+        elapsed: float,
+        sc_sampling_mode: str | None,
+        *,
+        has_multimodal_inputs: bool,
     ) -> BackendGenerateResult:
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
@@ -756,7 +774,14 @@ class SGLangBackendAdapter:
                 return_support_complete=True,
             )
             tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
-        sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+        # Reserved vocabulary IDs are ordinary sampled text tokens when this
+        # request has no media. Keep their behavior probabilities aligned with
+        # the original IDs; processor presence alone does not imply media input.
+        sanitized_tokens = (
+            tokens
+            if sc_sampling_mode is not None and not has_multimodal_inputs
+            else _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+        )
         if sc_sampling_mode is not None and sanitized_tokens != tokens:
             raise ValueError(
                 "Score Centering requires the original sampled token IDs; token sanitization changed them."
@@ -832,6 +857,7 @@ class SGLangBackendAdapter:
 
         pending = set(self._session_endpoints.get(session_id) or ()) or None
         outcomes: dict[str, dict[str, Any]] = {}
+        seal_pending = getattr(self._args, "router_decode_policy", None) == "session_least_load"
 
         def endpoint(url: str) -> str:
             try:
@@ -860,7 +886,27 @@ class SGLangBackendAdapter:
                 outcomes[key] = {"control_ack": "http_success"}
                 pending.discard(url)
 
-        async def close_window() -> None:
+        async def seal_route() -> None:
+            nonlocal seal_pending
+            # Routing seal is independent of physical worker cleanup. A failed
+            # seal must not prevent workers from receiving their close controls.
+            try:
+                receipt = await post(
+                    f"{self._router_url}/session_routes/close",
+                    {"session_id": session_id},
+                    max_retries=1,
+                    client=self._managed_http,
+                )
+                if not isinstance(receipt, dict) or receipt.get("sealed") is not True:
+                    raise RuntimeError("Router did not confirm the session routing seal")
+            except Exception as error:
+                outcomes["router_seal"] = {"control_ack": "unknown", "error_type": type(error).__name__}
+            else:
+                # 202 is only a seal ACK: uncertain requests stay owned by Router.
+                seal_pending = False
+                outcomes["router_seal"] = {"control_ack": "sealed"}
+
+        async def close_workers() -> None:
             nonlocal pending
             if pending is None:
                 urls = await self._worker_urls()
@@ -878,22 +924,40 @@ class SGLangBackendAdapter:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+        async def close_window() -> None:
+            if not seal_pending:
+                await close_workers()
+                return
+            # Start the seal first, but allow cleanup to progress independently
+            # if its HTTP response is lost. Both fit the existing window deadline.
+            tasks = [asyncio.create_task(seal_route()), asyncio.create_task(close_workers())]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
         try:
             for attempt in range(1, 4):
                 started = time.monotonic()
-                stage = "discovery" if pending is None else "targets"
+                stage = "router_seal" if seal_pending else ("discovery" if pending is None else "targets")
                 error_type = None
                 try:
                     await asyncio.wait_for(close_window(), timeout=timeout_s)
                 except Exception as error:
                     error_type = type(error).__name__
-                if pending is not None:
+                if pending is not None and not seal_pending:
                     stage = "targets"
                     for url in pending:
                         key = endpoint(url)
                         if error_type is not None and outcomes.get(key, {}).get("error_type") is None:
                             outcomes[key] = {"control_ack": "unknown", "error_type": error_type, "http_status": None}
-                if pending is not None and not pending:
+                if not seal_pending and pending is not None and not pending:
                     if attempt > 1:
                         logger.info(
                             "Backend session close control recovered session_id=%s attempt=%d targets=%s",

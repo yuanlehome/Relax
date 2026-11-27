@@ -17,7 +17,7 @@ generate = replay.generate
 router = replay.router
 
 
-pytestmark = pytest.mark.parametrize("router", ["pd-retry"], indirect=True)
+pytestmark = pytest.mark.parametrize("router", ["pd-retry", "session"], indirect=True)
 
 
 class Fault:

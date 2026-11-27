@@ -226,3 +226,99 @@ def test_discovery_deadline_and_empty_targets_stay_false(runtime):
     asyncio.run(run())
     text = "\n".join(lines)
     assert "stage=discovery" in text and "TimeoutError" in text and "RuntimeError" in text
+
+
+@pytest.mark.parametrize("seal_status", [202, 503, 200])
+def test_session_route_seal_is_required_but_does_not_block_worker_cleanup(runtime, seal_status):
+    module, lines = runtime
+
+    async def run():
+        calls = Counter()
+        order = []
+
+        async def transport(request):
+            calls[request.url.path] += 1
+            order.append(request.url.path)
+            if request.url.path == "/session_routes/close":
+                return httpx.Response(
+                    seal_status,
+                    json={"sealed": seal_status == 202, "binding_released": False, "cleanup_unconfirmed": 1},
+                )
+            return httpx.Response(200)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            backend = make_backend(module, client, ["http://a:8000"])
+            backend._args.router_decode_policy = "session_least_load"
+            assert await backend.close_session(SID, timeout_s=0.1) is (seal_status == 202)
+            assert order[0] == "/session_routes/close"
+            assert calls["/session_routes/close"] == (1 if seal_status == 202 else 3)
+            assert calls["/close_session"] == 1
+
+    asyncio.run(run())
+
+
+def test_session_route_seal_runs_even_when_discovery_fails(runtime):
+    module, _ = runtime
+
+    async def run():
+        calls = Counter()
+
+        async def transport(request):
+            calls[request.url.path] += 1
+            if request.url.path == "/session_routes/close":
+                return httpx.Response(200, json={"sealed": True})
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            backend = make_backend(module, client)
+            backend._args.router_decode_policy = "session_least_load"
+            assert await backend.close_session(SID, timeout_s=0.1) is False
+            assert calls["/session_routes/close"] == 1
+            assert calls["/workers"] == calls["/list_workers"] == 3
+
+    asyncio.run(run())
+
+
+def test_cancel_waits_for_pending_seal_and_worker_controls(runtime):
+    module, _ = runtime
+
+    async def run():
+        entered = asyncio.Event()
+        active = set()
+        finished = set()
+
+        async def transport(request):
+            path = request.url.path
+            active.add(path)
+            if len(active) == 2:
+                entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active.remove(path)
+                finished.add(path)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            backend = make_backend(module, client, ["http://a:8000"])
+            backend._args.router_decode_policy = "session_least_load"
+            task = asyncio.create_task(backend.close_session(SID, timeout_s=3))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not active
+            assert finished == {"/session_routes/close", "/close_session"}
+
+    asyncio.run(run())
+
+
+def test_session_policy_requires_lifecycle_before_loading_resources(runtime, monkeypatch):
+    module, _ = runtime
+
+    def forbidden_resources(_args):
+        raise AssertionError("invalid session policy configuration must fail before resource loading")
+
+    monkeypatch.setattr(module, "load_agentic_compiler_resources", forbidden_resources)
+    args = Namespace(agentic_session_lifecycle=False, router_decode_policy="session_least_load")
+    with pytest.raises(ValueError, match="agentic_session_lifecycle"):
+        module.SGLangBackendAdapter(args)

@@ -1010,8 +1010,12 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     return adapter
 
 
-@pytest.mark.parametrize("lifecycle_enabled", [False, True])
-async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
+@pytest.mark.parametrize(
+    "lifecycle_enabled,decode_policy", [(False, None), (True, None), (True, "session_least_load")]
+)
+async def test_generate_preserves_history_routing_and_session_lifecycle(
+    monkeypatch, lifecycle_enabled, decode_policy
+) -> None:
     calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False, max_retries=6):
@@ -1030,7 +1034,8 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
     await shard.set_router_address("10.0.0.1", 8000)
     with pytest.raises(RuntimeError, match="Cannot replace"):
         await shard.set_router_address("other-router", 8000)
-    adapter._args.sglang_router_policy = "consistent_hashing"
+    adapter._args.sglang_router_policy = "cache_aware" if decode_policy else "consistent_hashing"
+    adapter._args.router_decode_policy = decode_policy
     adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the router"))
     result = await adapter.generate(
         input_ids=[1, 2, 3],
@@ -1139,6 +1144,101 @@ async def test_generate_score_centering_candidates_are_training_only(monkeypatch
     else:
         assert "top_logprobs_num" not in calls[0]
         assert result.new_topk_token_ids is result.new_topk_log_probs is None
+
+
+def _reserved_token_backend(monkeypatch) -> SGLangBackendAdapter:
+    async def fake_post(_url, _payload, **_kwargs):
+        return {
+            "output_ids": [97, 98, 99, 100],
+            "meta_info": {
+                "output_token_logprobs": [[-1.0, token, None] for token in (97, 98, 99, 100)],
+                "output_top_logprobs": [[[-1.0, token, None], [-2.0, 101, None]] for token in (97, 98, 99, 100)],
+                "finish_reason": {"type": "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.advantage_estimator = "score_centering"
+    adapter._args.rollout_top_logprobs_num = 2
+    adapter._args.rollout_temperature = 1.0
+    adapter._args.score_centering_vocab_size = 256
+    adapter.tokenizer.pad_token_id = 0
+    adapter.tokenizer.image_token_id = 97
+    adapter.tokenizer.audio_token_id = 98
+    adapter.tokenizer.video_token_id = 99
+    return adapter
+
+
+@pytest.mark.parametrize("empty_media", [None, []])
+async def test_generate_score_centering_preserves_text_only_reserved_tokens(monkeypatch, empty_media):
+    adapter = _reserved_token_backend(monkeypatch)
+    # A loaded VLM processor does not make a media-free request multimodal.
+    adapter.compiler.processor = SimpleNamespace()
+    result = await adapter.generate(
+        input_ids=[10, 11],
+        sampling_params={},
+        session_id="sc-text",
+        request_id="sc-text:0",
+        image_data=empty_media,
+        audio_data=empty_media,
+        video_data=empty_media,
+    )
+
+    assert result.new_tokens == result.raw_output_ids == [97, 98, 99, 100]
+    assert result.new_log_probs == [-1.0, -1.0, -1.0, -1.0]
+    np.testing.assert_array_equal(result.new_topk_token_ids, [[97, 101], [98, 101], [99, 101], [100, 101]])
+    np.testing.assert_array_equal(result.new_topk_log_probs, [[-1.0, -2.0]] * 4)
+    np.testing.assert_array_equal(result.new_topk_support_complete, [False] * 4)
+
+
+@pytest.mark.parametrize("media_key", ["image_data", "audio_data", "video_data"])
+async def test_generate_score_centering_media_sanitization_stays_fail_closed(monkeypatch, media_key):
+    adapter = _reserved_token_backend(monkeypatch)
+    with pytest.raises(ValueError, match="original sampled token IDs"):
+        await adapter.generate(
+            input_ids=[10, 11],
+            sampling_params={},
+            session_id="sc-media",
+            request_id="sc-media:0",
+            **{media_key: ["synthetic-media"]},
+        )
+
+
+async def test_generate_score_centering_kimi_media_placeholder_stays_fail_closed(monkeypatch):
+    class KimiK25Processor:
+        media_processor = object()
+        tokenizer = SimpleNamespace(pad_token_id=0, convert_tokens_to_ids=lambda _token: 100)
+
+    adapter = _reserved_token_backend(monkeypatch)
+    adapter.compiler.processor = KimiK25Processor()
+    adapter.tokenizer.image_token_id = adapter.tokenizer.audio_token_id = adapter.tokenizer.video_token_id = None
+    with pytest.raises(ValueError, match="original sampled token IDs"):
+        await adapter.generate(
+            input_ids=[10, 11],
+            sampling_params={},
+            session_id="sc-kimi-media",
+            request_id="sc-kimi-media:0",
+            image_data=["synthetic-media"],
+        )
+
+
+@pytest.mark.parametrize("image_data", [None, ["synthetic-media"]])
+async def test_generate_without_score_centering_preserves_reserved_token_sanitization(monkeypatch, image_data):
+    adapter = _reserved_token_backend(monkeypatch)
+    result = await adapter.generate(
+        input_ids=[10, 11],
+        sampling_params={},
+        session_id="text",
+        request_id="text:0",
+        collect_score_centering=False,
+        image_data=image_data,
+    )
+
+    assert result.new_tokens == [0, 0, 0, 100]
+    assert result.raw_output_ids == [97, 98, 99, 100]
+    assert result.new_log_probs == [-1.0, -1.0, -1.0, -1.0]
+    assert result.new_topk_token_ids is result.new_topk_log_probs is None
 
 
 @pytest.fixture
@@ -2204,6 +2304,67 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     assert ir.pending_weight_version_delta == ["v1"]
     assert ir.pending_spec_delta["completion_token_num"] == 1
     assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
+
+
+async def test_score_centering_reserved_tokens_survive_partial_resume_and_export(monkeypatch):
+    adapter = _reserved_token_backend(monkeypatch)
+    adapter.compiler.processor = SimpleNamespace()
+    calls = []
+    attempts = iter((([97, 98], "abort"), ([99, 100], "stop")))
+
+    async def fake_post(_url, payload, **_kwargs):
+        calls.append(list(payload["input_ids"]))
+        tokens, finish_type = next(attempts)
+        return {
+            "output_ids": tokens,
+            "meta_info": {
+                "prompt_tokens": len(payload["input_ids"]),
+                "output_token_logprobs": [[-1.0, token, None] for token in tokens],
+                "output_top_logprobs": [[[-1.0, token, None], [-2.0, 101, None]] for token in tokens],
+                "finish_reason": {"type": finish_type},
+            },
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_reasoning_parser = shard.args.agentic_tool_call_parser = None
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._generation_backend = adapter
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    ir.history_train_token_prefix = ir.history_rollout_token_prefix = [112]
+    ir.pending_token_delta = []
+    for attempt in range(2):
+        task = asyncio.create_task(shard._run_ir(session, ir))
+        ir.runner_task = task
+        await task
+        if session.cleanup_task is not None:
+            await session.cleanup_task
+        if ir.waiter.done():
+            ir.waiter.result()
+        if attempt == 0:
+            assert ir.pending_token_delta == [97, 98]
+            assert ir.abort_count == 1
+            assert session.queued_irs.popleft() is ir
+
+    assert calls == [[112], [112, 97, 98]]
+    assert ir not in session.live_irs and not session.queued_irs
+    sample = forest.build_sample(
+        leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=adapter.tokenizer
+    )
+    assert sample.tokens == [112, 97, 98, 99, 100]
+    assert sample.loss_mask == [1, 1, 1, 1]
+    assert sample.rollout_log_probs == [-1.0, -1.0, -1.0, -1.0]
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 101], [98, 101], [99, 101], [100, 101]])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0]] * 4)
+    np.testing.assert_array_equal(sample.rollout_topk_support_complete, [False] * 4)
 
 
 async def test_score_centering_partial_attempts_commit_aligned_candidates() -> None:
